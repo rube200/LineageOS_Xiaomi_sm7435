@@ -1,0 +1,145 @@
+name: Sync upstream and KernelSU-Next
+
+on:
+  schedule:
+    - cron: '0 5 * * 4'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+
+env:
+  UPSTREAM_URL: https://github.com/LineageOS/android_kernel_xiaomi_sm7435.git
+  UPSTREAM_BRANCH: lineage-23.2
+  KSU_PATH: KernelSU-Next
+
+jobs:
+  sync:
+    name: Rebase and update KernelSU-Next
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check default branch
+        if: github.ref_name != github.event.repository.default_branch
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          echo "::error::Run from the default branch ($DEFAULT_BRANCH), not $REF_NAME."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        id: upstream
+        run: |
+          git fetch --no-tags "$UPSTREAM_URL" \
+            "+refs/heads/$UPSTREAM_BRANCH:refs/remotes/upstream/$UPSTREAM_BRANCH"
+          echo "base=refs/remotes/upstream/$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "old_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase onto upstream
+        id: rebase
+        continue-on-error: true
+        env:
+          BASE: ${{ steps.upstream.outputs.base }}
+        run: git rebase "$BASE"
+
+      - name: Report rebase conflicts
+        if: steps.rebase.outcome == 'failure'
+        run: |
+          echo "::error::Rebase onto $UPSTREAM_BRANCH hit conflicts; resolve them manually."
+          echo "::group::Conflicting files"
+          git diff --name-only --diff-filter=U
+          echo "::endgroup::"
+          git rebase --abort
+          exit 1
+
+      - name: Resolve KernelSU-Next
+        id: ksu
+        env:
+          BASE: ${{ steps.upstream.outputs.base }}
+        run: |
+          url=$(git config -f .gitmodules "submodule.$KSU_PATH.url")
+          branch=$(git config -f .gitmodules "submodule.$KSU_PATH.branch")
+          {
+            echo "url=$url"
+            echo "branch=$branch"
+            echo "old=$(git rev-parse "HEAD:$KSU_PATH")"
+            echo "new=$(git ls-remote "$url" "refs/heads/$branch" | cut -f1)"
+            echo "target=$(git log -1 --format=%H "$BASE..HEAD" -- "$KSU_PATH")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check KernelSU-Next
+        if: steps.ksu.outputs.new == '' || steps.ksu.outputs.target == ''
+        env:
+          KSU_URL: ${{ steps.ksu.outputs.url }}
+          KSU_BRANCH: ${{ steps.ksu.outputs.branch }}
+        run: |
+          echo "::error::Could not resolve $KSU_BRANCH of $KSU_URL, or no commit of ours touches $KSU_PATH."
+          exit 1
+
+      - name: Fold KernelSU-Next update into existing commit
+        if: steps.ksu.outputs.new != steps.ksu.outputs.old
+        env:
+          BASE: ${{ steps.upstream.outputs.base }}
+          KSU_NEW: ${{ steps.ksu.outputs.new }}
+          TARGET: ${{ steps.ksu.outputs.target }}
+        run: |
+          git update-index --cacheinfo "160000,$KSU_NEW,$KSU_PATH"
+          git commit -q --fixup="$TARGET"
+          git -c sequence.editor=true rebase -i --autosquash "$BASE"
+
+      - name: Read new head
+        id: head
+        run: echo "new_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Summary upstream
+        if: always() && steps.upstream.outcome == 'success'
+        env:
+          BASE: ${{ steps.upstream.outputs.base }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### Sync result: $JOB_STATUS"
+            echo "- Upstream \`$UPSTREAM_BRANCH\`: \`$(git rev-parse --short "$BASE")\`"
+            echo "- Commits ahead of upstream: $(git rev-list --count "$BASE..HEAD")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary KernelSU-Next
+        if: always() && steps.ksu.outcome == 'success'
+        env:
+          KSU_BRANCH: ${{ steps.ksu.outputs.branch }}
+          KSU_OLD: ${{ steps.ksu.outputs.old }}
+          KSU_NEW: ${{ steps.ksu.outputs.new }}
+        run: |
+          echo "- $KSU_PATH \`$KSU_BRANCH\`: \`${KSU_OLD:0:9}\` -> \`${KSU_NEW:0:9}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push
+        if: steps.head.outputs.new_head != steps.upstream.outputs.old_head
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          OLD_HEAD: ${{ steps.upstream.outputs.old_head }}
+          NEW_HEAD: ${{ steps.head.outputs.new_head }}
+        run: |
+          git push --force-with-lease="$REF_NAME:$OLD_HEAD" origin "HEAD:refs/heads/$REF_NAME"
+          echo "- Pushed \`${OLD_HEAD:0:9}\` -> \`${NEW_HEAD:0:9}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report up to date
+        if: steps.head.outputs.new_head == steps.upstream.outputs.old_head
+        run: |
+          echo "::notice::Already up to date; nothing to push."
+          echo "- Already up to date; nothing pushed." >> "$GITHUB_STEP_SUMMARY"
