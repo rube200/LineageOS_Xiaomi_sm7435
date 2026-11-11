@@ -20,7 +20,7 @@ integration:
 
 | Where | What |
 |-------|------|
-| `KernelSU-Next/` | Submodule, branch `stable`, pinned at `v3.3.0` (`3b18216f`) |
+| `KernelSU-Next/` | Submodule tracking branch `dev`; the pointer is bumped weekly by `.github/workflows/sync-upstream.yml` |
 | `drivers/kernelsu` | Symlink to `../KernelSU-Next/kernel` — only that subdir is built |
 | `drivers/Kconfig` | `source "drivers/kernelsu/Kconfig"` |
 | `drivers/Makefile` | `obj-$(CONFIG_KSU) += kernelsu/` |
