@@ -20,7 +20,7 @@ integration:
 
 | Where | What |
 |-------|------|
-| `KernelSU-Next/` | Submodule tracking branch `dev`; the pointer is bumped weekly by `.github/workflows/sync-upstream.yml` |
+| `KernelSU-Next/` | Submodule pinned to a KernelSU-Next release; the weekly sync in `.github/workflows/sync-upstream.yml` moves it to the newest `vX.Y.Z` release tag |
 | `drivers/kernelsu` | Symlink to `../KernelSU-Next/kernel` — only that subdir is built |
 | `drivers/Kconfig` | `source "drivers/kernelsu/Kconfig"` |
 | `drivers/Makefile` | `obj-$(CONFIG_KSU) += kernelsu/` |
@@ -32,13 +32,73 @@ Neither `git clone` nor `repo sync` fetches the submodule, and without it
 git submodule update --init --recursive
 ```
 
-Bump it with `git submodule update --remote KernelSU-Next`, then commit the new
-pointer.
+Run it again after every pull or `repo sync`. The recorded commit moves when
+the weekly sync picks up a new release, and a checkout that lags behind still
+builds, using the older KernelSU-Next. The build prints a warning from
+`drivers/Makefile` when the checkout is not the recorded commit.
+
+Keep the submodule a full clone (no `--depth`). KernelSU-Next takes its version
+from its own git history at build time (30000 + number of commits) and prints
+it as `-- KernelSU-Next version: …`. A shallow clone reports 30001, and a build
+without `git` falls back to 1. The build warns about a shallow clone as well.
+
+To move to another release by hand, check out its tag in the submodule and
+commit the new pointer:
+
+```
+git -C KernelSU-Next fetch --tags origin
+git -C KernelSU-Next checkout v3.4.2
+git add KernelSU-Next
+```
+
+The weekly sync always sets the pointer to the newest release tag, so a manual
+pin to anything else only lasts until the next sync.
 
 `CONFIG_KSU` defaults to `y` and its dependencies (`KPROBES`, `EXT4_FS`) are
 already set in `gki_defconfig`, so a normal build compiles root in with no
 defconfig change here. For the remaining options and how root itself works, see
 upstream.
+
+## Weekly sync
+
+`.github/workflows/sync-upstream.yml` runs every Thursday, and on manual
+dispatch from the default branch. When LineageOS `lineage-23.2` has moved or
+the submodule is not at the newest KernelSU-Next release tag (`vX.Y.Z`; side
+lines such as `v3.4.0-legacy` are ignored), it:
+
+1. rebases the commits of this repo onto the new upstream tip and folds the new
+   KernelSU-Next pointer into the existing submodule commit;
+2. pushes the result to the branch `sync-candidate`;
+3. compiles `drivers/net/wireguard/` and `drivers/kernelsu/` from that branch
+   (arm64, `gki_defconfig`, clang) in a job that only has a read-only token;
+4. moves the default branch to the candidate and deletes `sync-candidate`, but
+   only if the compile succeeded.
+
+If the rebase conflicts or the compile fails, the default branch is left alone.
+After a failed compile `sync-candidate` stays in place so the result can be
+inspected; the next run overwrites it.
+
+After each successful sync the tag `sync-upstream-base` is set to the upstream
+commit the default branch now sits on. If LineageOS ever rewrites the history
+of its branch, the next sync uses that tag to replay only this repo's commits,
+and not the upstream commits that were dropped by the rewrite.
+
+Every sync rewrites the default branch: it is force-pushed, and the rebased
+commits get new hashes with `github-actions[bot]` as committer. To bring a
+clone up to date afterwards:
+
+```
+git fetch origin
+git reset --hard origin/lineage-23.2
+git submodule update --init --recursive
+```
+
+Local commits and open pull requests have to be rebased onto the new branch.
+
+`SYNC_TOKEN` is an optional repository secret: a personal access token with
+write access to the repository contents. When it is set the workflow uses it
+for checkout and push; otherwise it uses the built-in `GITHUB_TOKEN`. Set it
+if the built-in token is not allowed to update the default branch.
 
 ---
 
@@ -58,7 +118,7 @@ Encode before send, decode after receive — then normal WireGuard processing. S
 ## Detecting obfuscation support (apps)
 
 VPN apps need to distinguish **WireGuard present** from **obfuscation UAPI supported**.
-Peer attrs 9/10 only appear on peer dump, so an empty `wg0` gives no obfuscation signal.
+Peer attrs 11/12 only appear on peer dump, so an empty `wg0` gives no obfuscation signal.
 Use the device-level capability below (works with zero peers).
 
 | Signal | Where | Meaning |
@@ -88,7 +148,7 @@ Coverage:
 - Header encode/decode for all message types
 - Handshake suffix length (0 and max 32 bytes)
 - Send decision (`wg_obf_active_for_send`) — configured vs reactive
-- RX format learning, configured override, reset on `wg down`
+- RX format learning, configured override
 - UAPI format helper
 - Round-trip wrap + parse (initiation, cookie, data packets)
 
@@ -115,6 +175,8 @@ byte3 = junk[2]
 ```
 
 If any of bytes 1–3 are non-zero, the packet is treated as obfuscated on RX.
+The sender never uses three zero junk bytes, so an obfuscated packet cannot
+come out looking like a standard one.
 
 ### Handshake packets (initiation, response, cookie)
 
@@ -144,13 +206,17 @@ Vendor netlink attributes (see `include/uapi/linux/wireguard.h`):
 | Attribute | ID | SET | GET |
 |-----------|----|-----|-----|
 | `WGDEVICE_A_OBFUSCATION_SUPPORT` | 9 | — (read-only; `-EINVAL` on SET) | u8 `1` (first GET dump message only) |
-| `WGPEER_A_OBFUSCATION` | 9 | u8 `0` or `1` | u8 `0` or `1` (only if configured) |
-| `WGPEER_A_OBFUSCATION_FORMAT` | 10 | — (read-only) | u8 format enum |
+| `WGPEER_A_OBFUSCATION` | 11 | u8 `0` or `1` (anything else: `-EINVAL`, nothing is changed) | u8 `0` or `1` (only if configured) |
+| `WGPEER_A_OBFUSCATION_FORMAT` | 12 | — (read-only) | u8 format enum |
 
 Format values (`wgpeer_obfuscation_format`):
 
 - `WGPEER_OBFUSCATION_FORMAT_STANDARD` (1)
 - `WGPEER_OBFUSCATION_FORMAT_OBFUSCATED` (2)
+
+This is the format used for sending, so a reactive peer reads as `STANDARD`
+until it has learned otherwise. `WGPEER_OBFUSCATION_FORMAT_UNKNOWN` (0) is
+reserved and never reported.
 
 ### Client (outbound obfuscation)
 
@@ -168,8 +234,14 @@ RX.
 ### Server (reactive mode)
 
 **Omit** `WGPEER_A_OBFUSCATION` on SET for each client peer. The driver learns
-the packet format per peer from the first **authenticated** RX packet (handshake
-after Noise validation, data after decrypt + replay check).
+the packet format per peer from **authenticated** RX packets (handshake after
+Noise validation, data after decrypt + replay check) and always follows the
+most recent one.
+
+A newly created peer entry has learned nothing yet. If the server is the side
+that starts the first handshake with it, that handshake goes out in standard
+format. Where every client obfuscates, set `WGPEER_A_OBFUSCATION = 1` on the
+server's peers too instead of leaving them reactive.
 
 Each client is independent: one peer may use obfuscation, another standard.
 
@@ -191,11 +263,8 @@ if (obfuscation_configured) → obfuscation_outbound
 else                         → obfuscation_learned
 ```
 
-On `wg down` (`wg_obf_peer_reset_format`):
-
-- **Reactive peers:** `obfuscation_learned` is **kept** across down/up.
-- **Configured peers:** `obfuscation_learned` is cleared (outbound/configured
-  unchanged).
+`wg down` does not touch these fields: a reactive peer keeps its learned format
+across down/up, and a configured peer keeps its setting.
 
 ---
 
@@ -207,9 +276,8 @@ On `wg down` (`wg_obf_peer_reset_format`):
 | `drivers/net/wireguard/send.c` | Obfuscate handshake and data headers on TX |
 | `drivers/net/wireguard/receive.c` | Parse before dispatch; learn format on RX |
 | `drivers/net/wireguard/netlink.c` | Peer GET/SET; device GET emits `WGDEVICE_A_OBFUSCATION_SUPPORT`; SET rejects it |
-| `drivers/net/wireguard/version.h` | Driver version string (`1.0.0+obf1`); must match `WG_OBFUSCATION_UAPI_VERSION` |
+| `drivers/net/wireguard/version.h` | Driver version string (`1.0.0+obf1`); the suffix is generated from `WG_OBFUSCATION_UAPI_VERSION` |
 | `drivers/net/wireguard/peer.h` | Peer obfuscation fields |
-| `drivers/net/wireguard/device.c` | `wg_obf_peer_reset_format()` on interface stop |
 | `include/uapi/linux/wireguard.h` | UAPI attribute definitions |
 | `drivers/net/wireguard/selftest/obfuscation.c` | DEBUG selftests |
 | `drivers/net/wireguard/Makefile` | Adds `obfuscation.o` |
@@ -222,13 +290,21 @@ On `wg down` (`wg_obf_peer_reset_format`):
   obfuscation for classification evasion, not secrecy.
 - **No stock interop:** upstream WireGuard cannot parse obfuscated packets.
 - **Userspace:** driver change is kernel-side only; VPN apps / `wg` must send
-  netlink attr 9 for client configuration.
+  netlink attr 11 (`WGPEER_A_OBFUSCATION`) for client configuration.
 - **Queued packets:** toggling obfuscation may not apply to packets already in
   the encrypt queue until the next batch.
-- **Reactive unconfigure:** omitting attr 9 on SET does not revert a peer to
+- **Reactive unconfigure:** omitting attr 11 on SET does not revert a peer to
   reactive mode after it was configured; remove and re-add the peer instead.
 - **`obf_wire_len`:** stored in `skb` control block for RX byte stats on
   obfuscated handshakes; not required for protocol logic.
+- **Header is not authenticated:** the header bytes and the trailing junk are
+  outside the Noise and AEAD checks. A device on the path can rewrite a packet
+  into the other format, and a reactive peer will then answer in that format.
+- **Attribute numbers:** the vendor attributes take the next free numbers after
+  upstream's (device 9; peer 11 and 12). A future upstream attribute would
+  claim the same numbers. `netlink.c` has a build-time check on the three
+  numbers, so a merge that shifts them fails to compile instead of silently
+  changing what apps talk to.
 
 ---
 
@@ -236,7 +312,10 @@ On `wg down` (`wg_obf_peer_reset_format`):
 
 Format learning happens only after authentication (Noise handshake or data
 decrypt + replay window check). Configured clients are not overwritten by RX
-learning. No extra heap allocations in the obfuscation path; skb and peer
+learning. The obfuscation path allocates nothing for ordinary packets; only
+when a received buffer is shared (for example while a packet socket is
+capturing) is the header copied before it is rewritten, so other readers of
+that buffer keep seeing the bytes that were on the wire. skb and peer
 lifecycle match upstream WireGuard.
 
 ---

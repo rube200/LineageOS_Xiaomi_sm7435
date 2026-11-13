@@ -13,12 +13,23 @@
 
 #include <uapi/linux/wireguard.h>
 
+#include <linux/build_bug.h>
 #include <linux/if.h>
 #include <net/genetlink.h>
 #include <net/sock.h>
 #include <crypto/algapi.h>
 
 static struct genl_family genl_family;
+
+/* Apps address the vendor attributes by number, so the numbers are ABI. They
+ * directly follow upstream's attributes, and a merge that adds an upstream
+ * attribute would shift them without any other sign. If this fails, renumber
+ * on purpose and bump WG_OBFUSCATION_UAPI_VERSION so that apps can tell.
+ */
+static_assert(WG_OBFUSCATION_UAPI_VERSION == 1 &&
+	      WGDEVICE_A_OBFUSCATION_SUPPORT == 9 &&
+	      WGPEER_A_OBFUSCATION == 11 &&
+	      WGPEER_A_OBFUSCATION_FORMAT == 12);
 
 static const struct nla_policy device_policy[WGDEVICE_A_MAX + 1] = {
 	[WGDEVICE_A_IFINDEX]		= { .type = NLA_U32 },
@@ -385,6 +396,11 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 	    nla_len(attrs[WGPEER_A_PRESHARED_KEY]) == NOISE_SYMMETRIC_KEY_LEN)
 		preshared_key = nla_data(attrs[WGPEER_A_PRESHARED_KEY]);
 
+	/* Reject a bad value before the peer is looked up or created. */
+	if (attrs[WGPEER_A_OBFUSCATION] &&
+	    nla_get_u8(attrs[WGPEER_A_OBFUSCATION]) > 1)
+		goto out;
+
 	if (attrs[WGPEER_A_FLAGS])
 		flags = nla_get_u32(attrs[WGPEER_A_FLAGS]);
 	ret = -EOPNOTSUPP;
@@ -440,6 +456,16 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 		goto out;
 	}
 
+	/* Applied before anything below can start a handshake. The direction
+	 * is written first, so a sender never sees a newly configured peer
+	 * with the previous direction.
+	 */
+	if (attrs[WGPEER_A_OBFUSCATION]) {
+		WRITE_ONCE(peer->obfuscation_outbound,
+			   !!nla_get_u8(attrs[WGPEER_A_OBFUSCATION]));
+		WRITE_ONCE(peer->obfuscation_configured, true);
+	}
+
 	if (preshared_key) {
 		down_write(&peer->handshake.lock);
 		memcpy(&peer->handshake.preshared_key, preshared_key,
@@ -491,17 +517,6 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 		peer->persistent_keepalive_interval = persistent_keepalive_interval;
 		if (send_keepalive)
 			wg_packet_send_keepalive(peer);
-	}
-
-	if (attrs[WGPEER_A_OBFUSCATION]) {
-		const u8 obfuscation = nla_get_u8(attrs[WGPEER_A_OBFUSCATION]);
-
-		if (obfuscation > 1) {
-			ret = -EINVAL;
-			goto out;
-		}
-		WRITE_ONCE(peer->obfuscation_configured, true);
-		WRITE_ONCE(peer->obfuscation_outbound, !!obfuscation);
 	}
 
 	if (netif_running(wg->dev))

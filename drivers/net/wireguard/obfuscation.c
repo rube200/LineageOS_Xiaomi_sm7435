@@ -9,6 +9,7 @@
 
 #include <linux/random.h>
 #include <linux/skbuff.h>
+#include <linux/slab.h>
 #include <uapi/linux/wireguard.h>
 
 static u8 obf_xor_mask(const u8 junk[3])
@@ -80,13 +81,6 @@ void wg_obf_peer_note_rx_format(struct wg_peer *peer, bool obfuscated)
 	WRITE_ONCE(peer->obfuscation_learned, obfuscated);
 }
 
-void wg_obf_peer_reset_format(struct wg_peer *peer)
-{
-	if (!READ_ONCE(peer->obfuscation_configured))
-		return;
-	WRITE_ONCE(peer->obfuscation_learned, false);
-}
-
 u8 wg_obf_peer_uapi_format(const struct wg_peer *peer)
 {
 	if (READ_ONCE(peer->obfuscation_configured))
@@ -102,9 +96,19 @@ void wg_obf_obfuscate_header_inplace(void *message, u8 msg_type,
 				     u8 junk_out[3])
 {
 	struct message_header *hdr = message;
+	u32 r;
 
-	wait_for_random_bytes();
-	get_random_bytes(junk_out, 3);
+	/* All-zero junk would put a standard header on the wire, and a reactive
+	 * peer would then switch back to the standard format. Draw again in
+	 * that case (one in 2^24). No need to wait for the RNG here: nothing is
+	 * sent before a handshake, and handshakes already wait for it.
+	 */
+	do {
+		r = get_random_u32() >> 8;
+	} while (unlikely(!r));
+	junk_out[0] = r;
+	junk_out[1] = r >> 8;
+	junk_out[2] = r >> 16;
 	wg_obf_encode_header(hdr, msg_type, junk_out);
 }
 
@@ -189,20 +193,24 @@ u8 wg_obf_parse_message(struct sk_buff *skb)
 	if (msg_type == MESSAGE_DATA) {
 		if (skb->len < MESSAGE_MINIMUM_LENGTH)
 			return 0;
-		PACKET_CB(skb)->obf_learned = true;
-		hdr->type = cpu_to_le32(msg_type);
-		return msg_type;
+	} else {
+		if (!obf_handshake_len_valid(msg_type, skb->len, junk,
+					     &base_len))
+			return 0;
+		if (pskb_trim(skb, base_len))
+			return 0;
 	}
 
-	if (!obf_handshake_len_valid(msg_type, skb->len, junk, &base_len))
+	/* The header is rewritten in place so the rest of the receive path sees
+	 * a standard message. The data may be shared with a clone (a packet
+	 * socket, for instance), so take a private copy first, and reload the
+	 * pointer because trimming or copying can move the data.
+	 */
+	if (skb_ensure_writable(skb, sizeof(*hdr)))
 		return 0;
-
-	PACKET_CB(skb)->obf_learned = true;
-
-	if (pskb_trim(skb, base_len))
-		return 0;
-
+	hdr = (struct message_header *)skb->data;
 	hdr->type = cpu_to_le32(msg_type);
+	PACKET_CB(skb)->obf_learned = true;
 	return msg_type;
 }
 

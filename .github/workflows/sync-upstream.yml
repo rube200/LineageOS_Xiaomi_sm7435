@@ -15,6 +15,11 @@ env:
   UPSTREAM_URL: https://github.com/LineageOS/android_kernel_xiaomi_sm7435.git
   UPSTREAM_BRANCH: lineage-23.2
   KSU_PATH: KernelSU-Next
+  # Release tags only (v3.4.2); side lines such as v3.4.0-legacy do not match.
+  KSU_TAG_PATTERN: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+  CANDIDATE_BRANCH: sync-candidate
+  # Tag that records the upstream commit the default branch was last rebased onto.
+  BASE_TAG: sync-upstream-base
 
 jobs:
   check:
@@ -24,7 +29,7 @@ jobs:
     outputs:
       upstream_changed: ${{ !contains(fromJSON('["ahead", "identical"]'), steps.upstream.outputs.status) }}
       ksu_changed: ${{ steps.ksu.outputs.new != steps.ksu.outputs.old }}
-      ksu_branch: ${{ steps.ksu.outputs.branch }}
+      ksu_tag: ${{ steps.ksu.outputs.tag }}
       ksu_old: ${{ steps.ksu.outputs.old }}
       ksu_new: ${{ steps.ksu.outputs.new }}
 
@@ -56,21 +61,28 @@ jobs:
         run: |
           gitmodules=$(gh api "repos/$GITHUB_REPOSITORY/contents/.gitmodules?ref=$REF_NAME" -H "Accept: application/vnd.github.raw")
           url=$(git config -f - "submodule.$KSU_PATH.url" <<< "$gitmodules")
-          branch=$(git config -f - "submodule.$KSU_PATH.branch" <<< "$gitmodules")
+          # Newest release tag by version number.
+          tag=$(git ls-remote --tags --refs "$url" | cut -f2 | sed 's|^refs/tags/||' |
+            grep -E "$KSU_TAG_PATTERN" | sort -V | tail -n 1)
+          # An annotated tag is listed twice, the second time ("^{}") with the
+          # commit it points to; a lightweight tag only has the first line.
+          new=
+          if [ -n "$tag" ]; then
+            new=$(git ls-remote "$url" "refs/tags/$tag" "refs/tags/$tag^{}" | tail -n 1 | cut -f1)
+          fi
           {
             echo "url=$url"
-            echo "branch=$branch"
+            echo "tag=$tag"
             echo "old=$(gh api "repos/$GITHUB_REPOSITORY/contents/$KSU_PATH?ref=$REF_NAME" --jq .sha)"
-            echo "new=$(git ls-remote "$url" "refs/heads/$branch" | cut -f1)"
+            echo "new=$new"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Check KernelSU-Next branch
+      - name: Check KernelSU-Next tag
         if: steps.ksu.outputs.new == ''
         env:
           KSU_URL: ${{ steps.ksu.outputs.url }}
-          KSU_BRANCH: ${{ steps.ksu.outputs.branch }}
         run: |
-          echo "::error::Could not resolve $KSU_BRANCH of $KSU_URL"
+          echo "::error::Found no release tag matching $KSU_TAG_PATTERN in $KSU_URL"
           exit 1
 
       - name: Report up to date
@@ -87,6 +99,10 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
+    outputs:
+      old_head: ${{ steps.upstream.outputs.old_head }}
+      new_head: ${{ steps.candidate.outputs.new_head }}
+      base_sha: ${{ steps.upstream.outputs.base_sha }}
 
     steps:
       - name: Checkout
@@ -108,14 +124,38 @@ jobs:
           git remote add -t "$UPSTREAM_BRANCH" upstream "$UPSTREAM_URL"
           git fetch --filter=tree:0 --no-tags upstream
           echo "base=refs/remotes/upstream/$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$(git rev-parse "refs/remotes/upstream/$UPSTREAM_BRANCH")" >> "$GITHUB_OUTPUT"
           echo "old_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Find our commits
+        id: ours
+        env:
+          BASE: ${{ steps.upstream.outputs.base }}
+        run: |
+          # Our commits normally start at the merge base with upstream. When
+          # upstream rewrites its history the merge base moves back, and the
+          # commits upstream dropped would be replayed as if they were ours.
+          # The publish job records the commit we were last rebased onto in
+          # $BASE_TAG; use it while it still lies between the merge base and
+          # HEAD, which is only the case after such a rewrite.
+          git fetch --no-tags origin "+refs/tags/$BASE_TAG:refs/tags/$BASE_TAG" 2>/dev/null || true
+          from=$(git merge-base HEAD "$BASE")
+          recorded=$(git rev-parse -q --verify "refs/tags/$BASE_TAG^{commit}" || true)
+          if [ -n "$recorded" ] && [ "$recorded" != "$from" ] &&
+             git merge-base --is-ancestor "$from" "$recorded" &&
+             git merge-base --is-ancestor "$recorded" HEAD; then
+            echo "::warning::$UPSTREAM_BRANCH was rewritten upstream; keeping only the commits after ${recorded:0:9}."
+            from=$recorded
+          fi
+          echo "from=$from" >> "$GITHUB_OUTPUT"
 
       - name: Rebase onto upstream
         id: rebase
         continue-on-error: true
         env:
           BASE: ${{ steps.upstream.outputs.base }}
-        run: git rebase "$BASE"
+          FROM: ${{ steps.ours.outputs.from }}
+        run: git rebase --onto "$BASE" "$FROM"
 
       - name: Report rebase conflicts
         if: steps.rebase.outcome == 'failure'
@@ -156,21 +196,104 @@ jobs:
         env:
           BASE: ${{ steps.upstream.outputs.base }}
           JOB_STATUS: ${{ job.status }}
-          KSU_BRANCH: ${{ needs.check.outputs.ksu_branch }}
+          KSU_TAG: ${{ needs.check.outputs.ksu_tag }}
           KSU_OLD: ${{ needs.check.outputs.ksu_old }}
           KSU_NEW: ${{ needs.check.outputs.ksu_new }}
         run: |
           {
             echo "### Sync result: $JOB_STATUS"
             echo "- Upstream \`$UPSTREAM_BRANCH\`: \`$(git rev-parse --short "$BASE")\`"
-            echo "- $KSU_PATH \`$KSU_BRANCH\`: \`${KSU_OLD:0:9}\` -> \`${KSU_NEW:0:9}\`"
+            echo "- $KSU_PATH \`$KSU_TAG\`: \`${KSU_OLD:0:9}\` -> \`${KSU_NEW:0:9}\`"
             echo "- Commits ahead of upstream: $(git rev-list --count "$BASE..HEAD")"
+            git log --format='  - `%h` %an: %s' "$BASE..HEAD"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push candidate
+        id: candidate
+        env:
+          OLD_HEAD: ${{ steps.upstream.outputs.old_head }}
+        run: |
+          new_head=$(git rev-parse HEAD)
+          if [ "$new_head" = "$OLD_HEAD" ]; then
+            echo "::notice::The rebase changed nothing; there is nothing to publish."
+            exit 0
+          fi
+          git push --force origin "HEAD:refs/heads/$CANDIDATE_BRANCH"
+          echo "new_head=$new_head" >> "$GITHUB_OUTPUT"
+          echo "- Candidate \`${new_head:0:9}\` pushed to \`$CANDIDATE_BRANCH\`; it is published once it compiles." >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Compile check
+    needs: sync
+    if: needs.sync.outputs.new_head != ''
+    # Pinned so the compiler does not change under the check. This job runs
+    # KernelSU-Next build scripts, so it gets a read-only token and no secrets.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      KMAKE: ARCH=arm64 LLVM=1 LLVM_IAS=1
+
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.new_head }}
+          submodules: true
+          persist-credentials: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm flex bison bc libssl-dev libelf-dev
+
+      - name: Configure
+        run: |
+          make -s O="$RUNNER_TEMP/out" $KMAKE gki_defconfig
+          # Only real errors should stop a sync, not warnings from a compiler
+          # that differs from the one used for release builds.
+          scripts/config --file "$RUNNER_TEMP/out/.config" --disable WERROR
+          make -s O="$RUNNER_TEMP/out" $KMAKE olddefconfig
+
+      - name: Compile WireGuard and KernelSU-Next
+        run: |
+          # KernelSU-Next includes headers that security/selinux generates.
+          make -j"$(nproc)" O="$RUNNER_TEMP/out" $KMAKE security/selinux/
+          make -j"$(nproc)" O="$RUNNER_TEMP/out" $KMAKE drivers/net/wireguard/ drivers/kernelsu/
+
+      - name: Compile WireGuard self-tests
+        run: |
+          scripts/config --file "$RUNNER_TEMP/out/.config" --enable WIREGUARD_DEBUG
+          make -s O="$RUNNER_TEMP/out" $KMAKE olddefconfig
+          make -j"$(nproc)" O="$RUNNER_TEMP/out" $KMAKE drivers/net/wireguard/
+
+  publish:
+    name: Update default branch
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.new_head }}
+          fetch-depth: 0
+          filter: tree:0
+          sparse-checkout: .github
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: Push
         env:
           REF_NAME: ${{ github.ref_name }}
-          OLD_HEAD: ${{ steps.upstream.outputs.old_head }}
+          OLD_HEAD: ${{ needs.sync.outputs.old_head }}
+          NEW_HEAD: ${{ needs.sync.outputs.new_head }}
+          BASE_SHA: ${{ needs.sync.outputs.base_sha }}
         run: |
-          git push --force-with-lease="$REF_NAME:$OLD_HEAD" origin "HEAD:refs/heads/$REF_NAME"
-          echo "- Pushed \`${OLD_HEAD:0:9}\` -> \`$(git rev-parse --short=9 HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+          git push --force-with-lease="$REF_NAME:$OLD_HEAD" origin "$NEW_HEAD:refs/heads/$REF_NAME"
+          echo "- Pushed \`${OLD_HEAD:0:9}\` -> \`${NEW_HEAD:0:9}\`" >> "$GITHUB_STEP_SUMMARY"
+          git push --force origin "$BASE_SHA:refs/tags/$BASE_TAG" ||
+            echo "::warning::Could not record the upstream base in tag $BASE_TAG."
+          git push origin --delete "$CANDIDATE_BRANCH" ||
+            echo "::warning::Could not delete $CANDIDATE_BRANCH; remove it by hand."

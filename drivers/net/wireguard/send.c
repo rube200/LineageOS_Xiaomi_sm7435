@@ -20,7 +20,7 @@
 #include <net/udp.h>
 #include <net/sock.h>
 
-static bool wg_packet_send_handshake_buffer(struct wg_peer *peer, void *packet,
+static void wg_packet_send_handshake_buffer(struct wg_peer *peer, void *packet,
 					    size_t len, u8 msg_type)
 {
 	u8 wire[sizeof(struct message_handshake_initiation) + WG_OBF_SUFFIX_MAX];
@@ -34,19 +34,19 @@ static bool wg_packet_send_handshake_buffer(struct wg_peer *peer, void *packet,
 		if (!wire_len) {
 			net_dbg_ratelimited("%s: Failed to obfuscate handshake for peer %llu\n",
 					    wg->dev->name, peer->internal_id);
-			return false;
+			return;
 		}
 		packet = wire;
 	}
 
+	/* A failed send is only logged: the caller has already updated the
+	 * timers and the rate limit, so the handshake is retried as usual.
+	 */
 	ret = wg_socket_send_buffer_to_peer(peer, packet, wire_len,
 					    HANDSHAKE_DSCP);
-	if (unlikely(ret < 0)) {
+	if (unlikely(ret < 0))
 		net_dbg_ratelimited("%s: Failed to send handshake to peer %llu (%d)\n",
 				    wg->dev->name, peer->internal_id, ret);
-		return false;
-	}
-	return true;
 }
 
 static void wg_packet_send_handshake_initiation(struct wg_peer *peer)
@@ -57,20 +57,19 @@ static void wg_packet_send_handshake_initiation(struct wg_peer *peer)
 				      REKEY_TIMEOUT))
 		return; /* This function is rate limited. */
 
+	atomic64_set(&peer->last_sent_handshake, ktime_get_coarse_boottime_ns());
 	net_dbg_ratelimited("%s: Sending handshake initiation to peer %llu (%pISpfsc)\n",
 			    peer->device->dev->name, peer->internal_id,
 			    &peer->endpoint.addr);
 
 	if (wg_noise_handshake_create_initiation(&packet, &peer->handshake)) {
 		wg_cookie_add_mac_to_packet(&packet, sizeof(packet), peer);
-		if (!wg_packet_send_handshake_buffer(peer, &packet,
-						   sizeof(packet),
-						   MESSAGE_HANDSHAKE_INITIATION))
-			return;
 		wg_timers_any_authenticated_packet_traversal(peer);
 		wg_timers_any_authenticated_packet_sent(peer);
 		atomic64_set(&peer->last_sent_handshake,
 			     ktime_get_coarse_boottime_ns());
+		wg_packet_send_handshake_buffer(peer, &packet, sizeof(packet),
+						MESSAGE_HANDSHAKE_INITIATION);
 		wg_timers_handshake_initiated(peer);
 	}
 }
@@ -125,10 +124,6 @@ void wg_packet_send_handshake_response(struct wg_peer *peer)
 
 	if (wg_noise_handshake_create_response(&packet, &peer->handshake)) {
 		wg_cookie_add_mac_to_packet(&packet, sizeof(packet), peer);
-		if (!wg_packet_send_handshake_buffer(peer, &packet,
-						   sizeof(packet),
-						   MESSAGE_HANDSHAKE_RESPONSE))
-			return;
 		if (wg_noise_handshake_begin_session(&peer->handshake,
 						     &peer->keypairs)) {
 			wg_timers_session_derived(peer);
@@ -136,6 +131,9 @@ void wg_packet_send_handshake_response(struct wg_peer *peer)
 			wg_timers_any_authenticated_packet_sent(peer);
 			atomic64_set(&peer->last_sent_handshake,
 				     ktime_get_coarse_boottime_ns());
+			wg_packet_send_handshake_buffer(peer, &packet,
+							sizeof(packet),
+							MESSAGE_HANDSHAKE_RESPONSE);
 		}
 	}
 }

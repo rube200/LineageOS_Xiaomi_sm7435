@@ -56,7 +56,9 @@
  *                SET leaves reactive mode; present forces off or on)
  *            WGPEER_A_OBFUSCATION_FORMAT: NLA_U8 (vendor extension, read-only;
  *                WGPEER_OBFUSCATION_FORMAT_STANDARD or
- *                WGPEER_OBFUSCATION_FORMAT_OBFUSCATED)
+ *                WGPEER_OBFUSCATION_FORMAT_OBFUSCATED; this is the format
+ *                used for sending, so a reactive peer reports STANDARD
+ *                until it has learned otherwise)
  *        0: NLA_NESTED
  *            ...
  *        ...
@@ -213,7 +215,7 @@ enum wgpeer_attribute {
 #define WGPEER_A_MAX (__WGPEER_A_LAST - 1)
 
 enum wgpeer_obfuscation_format {
-	WGPEER_OBFUSCATION_FORMAT_UNKNOWN = 0,
+	WGPEER_OBFUSCATION_FORMAT_UNKNOWN = 0,	/* reserved, never reported */
 	WGPEER_OBFUSCATION_FORMAT_STANDARD = 1,
 	WGPEER_OBFUSCATION_FORMAT_OBFUSCATED = 2,
 };

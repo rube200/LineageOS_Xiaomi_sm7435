@@ -32,7 +32,6 @@ bool wg_obf_header_looks_obfuscated(const struct message_header *hdr);
 bool wg_obf_active_for_send(const struct wg_peer *peer);
 
 void wg_obf_peer_note_rx_format(struct wg_peer *peer, bool obfuscated);
-void wg_obf_peer_reset_format(struct wg_peer *peer);
 
 u8 wg_obf_peer_uapi_format(const struct wg_peer *peer);
 
