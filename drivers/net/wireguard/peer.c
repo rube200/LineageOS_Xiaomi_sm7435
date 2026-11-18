@@ -4,6 +4,7 @@
  */
 
 #include "peer.h"
+#include "obfuscation.h"
 #include "device.h"
 #include "queueing.h"
 #include "timers.h"
@@ -44,6 +45,8 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
 	wg_cookie_init(&peer->latest_cookie);
 	wg_timers_init(peer);
 	wg_cookie_checker_precompute_peer_keys(peer);
+	wg_obf_derive_key(&peer->obf_key, public_key,
+			  wg->obf_has_secret ? wg->obf_secret : NULL);
 	spin_lock_init(&peer->keypairs.keypair_update_lock);
 	INIT_WORK(&peer->transmit_handshake_work, wg_packet_handshake_send_worker);
 	INIT_WORK(&peer->transmit_packet_work, wg_packet_tx_worker);

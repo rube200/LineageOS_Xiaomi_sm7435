@@ -11,6 +11,8 @@
 #include "peerlookup.h"
 #include "cookie.h"
 
+#include <linux/seqlock.h>
+#include <linux/siphash.h>
 #include <linux/types.h>
 #include <linux/netdevice.h>
 #include <linux/workqueue.h>
@@ -54,6 +56,11 @@ struct wg_device {
 	unsigned int num_peers, device_update_gen;
 	u32 fwmark;
 	u16 incoming_port;
+	seqlock_t obf_key_lock;
+	siphash_key_t obf_key;
+	bool obf_key_valid;
+	bool obf_has_secret;
+	u8 obf_secret[NOISE_SYMMETRIC_KEY_LEN];
 };
 
 int wg_device_init(void);

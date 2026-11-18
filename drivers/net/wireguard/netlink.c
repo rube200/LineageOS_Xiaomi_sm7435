@@ -13,12 +13,19 @@
 
 #include <uapi/linux/wireguard.h>
 
+#include <linux/build_bug.h>
 #include <linux/if.h>
 #include <net/genetlink.h>
 #include <net/sock.h>
 #include <crypto/algapi.h>
 
 static struct genl_family genl_family;
+
+static_assert(WG_OBFUSCATION_UAPI_VERSION == 1 &&
+	      WGDEVICE_A_OBFUSCATION_SUPPORT == 9 &&
+	      WGDEVICE_A_OBFUSCATION_KEY == 10 &&
+	      WGPEER_A_OBFUSCATION == 11 &&
+	      WGPEER_A_OBFUSCATION_FORMAT == 12);
 
 static const struct nla_policy device_policy[WGDEVICE_A_MAX + 1] = {
 	[WGDEVICE_A_IFINDEX]		= { .type = NLA_U32 },
@@ -30,6 +37,7 @@ static const struct nla_policy device_policy[WGDEVICE_A_MAX + 1] = {
 	[WGDEVICE_A_FWMARK]		= { .type = NLA_U32 },
 	[WGDEVICE_A_PEERS]		= { .type = NLA_NESTED },
 	[WGDEVICE_A_OBFUSCATION_SUPPORT] = { .type = NLA_U8 },
+	[WGDEVICE_A_OBFUSCATION_KEY]	= NLA_POLICY_EXACT_LEN(WG_OBF_SECRET_LEN),
 };
 
 static const struct nla_policy peer_policy[WGPEER_A_MAX + 1] = {
@@ -150,7 +158,7 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 
 		if (READ_ONCE(peer->obfuscation_configured) &&
 		    nla_put_u8(skb, WGPEER_A_OBFUSCATION,
-			       !!READ_ONCE(peer->obfuscation_outbound)))
+			       READ_ONCE(peer->obfuscation_outbound)))
 			goto err;
 
 		if (nla_put_u8(skb, WGPEER_A_OBFUSCATION_FORMAT,
@@ -247,7 +255,10 @@ static int wg_get_device_dump(struct sk_buff *skb, struct netlink_callback *cb)
 		    nla_put_u32(skb, WGDEVICE_A_IFINDEX, wg->dev->ifindex) ||
 		    nla_put_string(skb, WGDEVICE_A_IFNAME, wg->dev->name) ||
 		    nla_put_u8(skb, WGDEVICE_A_OBFUSCATION_SUPPORT,
-			       WG_OBFUSCATION_UAPI_VERSION))
+			       WG_OBFUSCATION_UAPI_VERSION) ||
+		    (wg->obf_has_secret &&
+		     nla_put(skb, WGDEVICE_A_OBFUSCATION_KEY, WG_OBF_SECRET_LEN,
+			     wg->obf_secret)))
 			goto out;
 
 		down_read(&wg->static_identity.lock);
@@ -385,6 +396,10 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 	    nla_len(attrs[WGPEER_A_PRESHARED_KEY]) == NOISE_SYMMETRIC_KEY_LEN)
 		preshared_key = nla_data(attrs[WGPEER_A_PRESHARED_KEY]);
 
+	if (attrs[WGPEER_A_OBFUSCATION] &&
+	    nla_get_u8(attrs[WGPEER_A_OBFUSCATION]) > 1)
+		goto out;
+
 	if (attrs[WGPEER_A_FLAGS])
 		flags = nla_get_u32(attrs[WGPEER_A_FLAGS]);
 	ret = -EOPNOTSUPP;
@@ -440,6 +455,16 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 		goto out;
 	}
 
+	if (attrs[WGPEER_A_OBFUSCATION]) {
+		const bool masked = nla_get_u8(attrs[WGPEER_A_OBFUSCATION]);
+		const bool rekey = wg_obf_peer_masked(peer) != masked;
+
+		WRITE_ONCE(peer->obfuscation_outbound, masked);
+		WRITE_ONCE(peer->obfuscation_configured, true);
+		if (rekey)
+			wg_noise_expire_current_peer_keypairs(peer);
+	}
+
 	if (preshared_key) {
 		down_write(&peer->handshake.lock);
 		memcpy(&peer->handshake.preshared_key, preshared_key,
@@ -491,17 +516,6 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 		peer->persistent_keepalive_interval = persistent_keepalive_interval;
 		if (send_keepalive)
 			wg_packet_send_keepalive(peer);
-	}
-
-	if (attrs[WGPEER_A_OBFUSCATION]) {
-		const u8 obfuscation = nla_get_u8(attrs[WGPEER_A_OBFUSCATION]);
-
-		if (obfuscation > 1) {
-			ret = -EINVAL;
-			goto out;
-		}
-		WRITE_ONCE(peer->obfuscation_configured, true);
-		WRITE_ONCE(peer->obfuscation_outbound, !!obfuscation);
 	}
 
 	if (netif_running(wg->dev))
@@ -571,6 +585,22 @@ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
 	if (flags & WGDEVICE_F_REPLACE_PEERS)
 		wg_peer_remove_all(wg);
 
+	if (info->attrs[WGDEVICE_A_OBFUSCATION_KEY] &&
+	    nla_len(info->attrs[WGDEVICE_A_OBFUSCATION_KEY]) ==
+		    WG_OBF_SECRET_LEN) {
+		const u8 *secret =
+			nla_data(info->attrs[WGDEVICE_A_OBFUSCATION_KEY]);
+
+		wg->obf_has_secret = !!memchr_inv(secret, 0, WG_OBF_SECRET_LEN);
+		if (wg->obf_has_secret)
+			memcpy(wg->obf_secret, secret, WG_OBF_SECRET_LEN);
+		else
+			memzero_explicit(wg->obf_secret, WG_OBF_SECRET_LEN);
+		down_read(&wg->static_identity.lock);
+		wg_obf_update_keys(wg);
+		up_read(&wg->static_identity.lock);
+	}
+
 	if (info->attrs[WGDEVICE_A_PRIVATE_KEY] &&
 	    nla_len(info->attrs[WGDEVICE_A_PRIVATE_KEY]) ==
 		    NOISE_PUBLIC_KEY_LEN) {
@@ -601,6 +631,7 @@ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
 		send_staged_packets = send_staged_packets && wg->static_identity.has_identity;
 
 		wg_cookie_checker_precompute_device_keys(&wg->cookie_checker);
+		wg_obf_update_keys(wg);
 		list_for_each_entry_safe(peer, temp, &wg->peer_list, peer_list) {
 			wg_noise_precompute_static_static(peer);
 			wg_noise_expire_current_peer_keypairs(peer);
@@ -635,6 +666,9 @@ out_nodev:
 	if (info->attrs[WGDEVICE_A_PRIVATE_KEY])
 		memzero_explicit(nla_data(info->attrs[WGDEVICE_A_PRIVATE_KEY]),
 				 nla_len(info->attrs[WGDEVICE_A_PRIVATE_KEY]));
+	if (info->attrs[WGDEVICE_A_OBFUSCATION_KEY])
+		memzero_explicit(nla_data(info->attrs[WGDEVICE_A_OBFUSCATION_KEY]),
+				 nla_len(info->attrs[WGDEVICE_A_OBFUSCATION_KEY]));
 	return ret;
 }
 

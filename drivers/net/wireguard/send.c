@@ -20,57 +20,58 @@
 #include <net/udp.h>
 #include <net/sock.h>
 
-static bool wg_packet_send_handshake_buffer(struct wg_peer *peer, void *packet,
-					    size_t len, u8 msg_type)
+static void wg_packet_send_handshake_buffer(struct wg_peer *peer, void *packet,
+					    size_t len, u8 msg_type, bool masked)
 {
 	u8 wire[sizeof(struct message_handshake_initiation) + WG_OBF_SUFFIX_MAX];
 	size_t wire_len = len;
 	struct wg_device *wg = peer->device;
+	siphash_key_t key;
 	int ret;
 
-	if (wg_obf_active_for_send(peer)) {
+	if (masked) {
+		wg_obf_peer_key(peer, &key);
 		wire_len = wg_obf_wrap_handshake(wire, sizeof(wire), packet,
-						 len, msg_type);
+						 len, msg_type, &key);
 		if (!wire_len) {
 			net_dbg_ratelimited("%s: Failed to obfuscate handshake for peer %llu\n",
 					    wg->dev->name, peer->internal_id);
-			return false;
+			return;
 		}
 		packet = wire;
 	}
 
 	ret = wg_socket_send_buffer_to_peer(peer, packet, wire_len,
 					    HANDSHAKE_DSCP);
-	if (unlikely(ret < 0)) {
+	if (unlikely(ret < 0))
 		net_dbg_ratelimited("%s: Failed to send handshake to peer %llu (%d)\n",
 				    wg->dev->name, peer->internal_id, ret);
-		return false;
-	}
-	return true;
 }
 
 static void wg_packet_send_handshake_initiation(struct wg_peer *peer)
 {
 	struct message_handshake_initiation packet;
+	const bool masked = wg_obf_peer_masked(peer);
 
 	if (!wg_birthdate_has_expired(atomic64_read(&peer->last_sent_handshake),
 				      REKEY_TIMEOUT))
 		return; /* This function is rate limited. */
 
+	atomic64_set(&peer->last_sent_handshake, ktime_get_coarse_boottime_ns());
 	net_dbg_ratelimited("%s: Sending handshake initiation to peer %llu (%pISpfsc)\n",
 			    peer->device->dev->name, peer->internal_id,
 			    &peer->endpoint.addr);
 
-	if (wg_noise_handshake_create_initiation(&packet, &peer->handshake)) {
+	if (wg_noise_handshake_create_initiation(&packet, &peer->handshake,
+						 masked)) {
 		wg_cookie_add_mac_to_packet(&packet, sizeof(packet), peer);
-		if (!wg_packet_send_handshake_buffer(peer, &packet,
-						   sizeof(packet),
-						   MESSAGE_HANDSHAKE_INITIATION))
-			return;
 		wg_timers_any_authenticated_packet_traversal(peer);
 		wg_timers_any_authenticated_packet_sent(peer);
 		atomic64_set(&peer->last_sent_handshake,
 			     ktime_get_coarse_boottime_ns());
+		wg_packet_send_handshake_buffer(peer, &packet, sizeof(packet),
+						MESSAGE_HANDSHAKE_INITIATION,
+						masked);
 		wg_timers_handshake_initiated(peer);
 	}
 }
@@ -117,18 +118,16 @@ out:
 void wg_packet_send_handshake_response(struct wg_peer *peer)
 {
 	struct message_handshake_response packet;
+	bool masked;
 
 	atomic64_set(&peer->last_sent_handshake, ktime_get_coarse_boottime_ns());
 	net_dbg_ratelimited("%s: Sending handshake response to peer %llu (%pISpfsc)\n",
 			    peer->device->dev->name, peer->internal_id,
 			    &peer->endpoint.addr);
 
-	if (wg_noise_handshake_create_response(&packet, &peer->handshake)) {
+	if (wg_noise_handshake_create_response(&packet, &peer->handshake,
+					       &masked)) {
 		wg_cookie_add_mac_to_packet(&packet, sizeof(packet), peer);
-		if (!wg_packet_send_handshake_buffer(peer, &packet,
-						   sizeof(packet),
-						   MESSAGE_HANDSHAKE_RESPONSE))
-			return;
 		if (wg_noise_handshake_begin_session(&peer->handshake,
 						     &peer->keypairs)) {
 			wg_timers_session_derived(peer);
@@ -136,6 +135,10 @@ void wg_packet_send_handshake_response(struct wg_peer *peer)
 			wg_timers_any_authenticated_packet_sent(peer);
 			atomic64_set(&peer->last_sent_handshake,
 				     ktime_get_coarse_boottime_ns());
+			wg_packet_send_handshake_buffer(peer, &packet,
+							sizeof(packet),
+							MESSAGE_HANDSHAKE_RESPONSE,
+							masked);
 		}
 	}
 }
@@ -144,8 +147,10 @@ void wg_packet_send_handshake_cookie(struct wg_device *wg,
 				     struct sk_buff *initiating_skb,
 				     __le32 sender_index)
 {
+	const bool masked = PACKET_CB(initiating_skb)->obf_masked;
 	struct message_handshake_cookie packet;
 	u8 wire[sizeof(packet) + WG_OBF_SUFFIX_MAX];
+	siphash_key_t key;
 	size_t wire_len;
 
 	net_dbg_skb_ratelimited("%s: Sending cookie response for denied handshake message for %pISpfsc\n",
@@ -153,10 +158,13 @@ void wg_packet_send_handshake_cookie(struct wg_device *wg,
 	wg_cookie_message_create(&packet, initiating_skb, sender_index,
 				 &wg->cookie_checker);
 
-	if (PACKET_CB(initiating_skb)->obf_learned) {
-		wire_len = wg_obf_wrap_handshake(
-			wire, sizeof(wire), &packet, sizeof(packet),
-			MESSAGE_HANDSHAKE_COOKIE);
+	if (masked) {
+		wire_len = 0;
+		if (wg_obf_device_key(wg, &key))
+			wire_len = wg_obf_wrap_handshake(wire, sizeof(wire),
+							 &packet, sizeof(packet),
+							 MESSAGE_HANDSHAKE_COOKIE,
+							 &key);
 		if (wire_len) {
 			wg_socket_send_buffer_as_reply_to_skb(wg, initiating_skb,
 							      wire, wire_len);
@@ -215,6 +223,8 @@ static bool encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
 	struct scatterlist sg[MAX_SKB_FRAGS + 8];
 	struct message_data *header;
 	struct wg_peer *peer = keypair->entry.peer;
+	const bool masked = keypair->obf_masked;
+	siphash_key_t key;
 	struct sk_buff *trailer;
 	int num_frags;
 
@@ -224,7 +234,8 @@ static bool encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
 	skb_get_hash(skb);
 
 	/* Calculate lengths. */
-	padding_len = calculate_skb_padding(skb);
+	padding_len = masked ? wg_obf_data_padding(skb) :
+			       calculate_skb_padding(skb);
 	trailer_len = padding_len + noise_encrypted_len(0);
 	plaintext_len = skb->len + padding_len;
 
@@ -254,15 +265,9 @@ static bool encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
 	 */
 	skb_set_inner_network_header(skb, 0);
 	header = (struct message_data *)skb_push(skb, sizeof(*header));
+	header->header.type = cpu_to_le32(MESSAGE_DATA);
 	header->key_idx = keypair->remote_index;
 	header->counter = cpu_to_le64(PACKET_CB(skb)->nonce);
-	if (wg_obf_active_for_send(peer)) {
-		u8 junk[3];
-
-		wg_obf_obfuscate_header_inplace(header, MESSAGE_DATA, junk);
-	} else {
-		header->header.type = cpu_to_le32(MESSAGE_DATA);
-	}
 	pskb_put(skb, trailer, trailer_len);
 
 	/* Now we can encrypt the scattergather segments */
@@ -270,9 +275,17 @@ static bool encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
 	if (skb_to_sgvec(skb, sg, sizeof(struct message_data),
 			 noise_encrypted_len(plaintext_len)) <= 0)
 		return false;
-	return chacha20poly1305_encrypt_sg_inplace(sg, plaintext_len, NULL, 0,
-						   PACKET_CB(skb)->nonce,
-						   keypair->sending.key);
+	if (unlikely(!chacha20poly1305_encrypt_sg_inplace(sg, plaintext_len,
+							  NULL, 0,
+							  PACKET_CB(skb)->nonce,
+							  keypair->sending.key)))
+		return false;
+
+	if (masked) {
+		wg_obf_peer_key(peer, &key);
+		wg_obf_mask_data(skb, &key);
+	}
+	return true;
 }
 
 void wg_packet_send_keepalive(struct wg_peer *peer)

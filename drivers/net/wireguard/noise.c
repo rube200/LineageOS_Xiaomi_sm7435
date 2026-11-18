@@ -6,6 +6,7 @@
 #include "noise.h"
 #include "device.h"
 #include "peer.h"
+#include "obfuscation.h"
 #include "messages.h"
 #include "queueing.h"
 #include "peerlookup.h"
@@ -82,6 +83,7 @@ static void handshake_zero(struct noise_handshake *handshake)
 	memset(&handshake->hash, 0, NOISE_HASH_LEN);
 	memset(&handshake->chaining_key, 0, NOISE_HASH_LEN);
 	handshake->remote_index = 0;
+	WRITE_ONCE(handshake->obf_masked, false);
 	handshake->state = HANDSHAKE_ZEROED;
 }
 
@@ -460,6 +462,14 @@ static void handshake_init(u8 chaining_key[NOISE_HASH_LEN],
 	mix_hash(hash, remote_static, NOISE_PUBLIC_KEY_LEN);
 }
 
+static const u8 obf_masked_label[8] = "mask-hs-";
+
+static void handshake_mix_obf(u8 hash[NOISE_HASH_LEN], bool obf_masked)
+{
+	if (obf_masked)
+		mix_hash(hash, obf_masked_label, sizeof(obf_masked_label));
+}
+
 static void message_encrypt(u8 *dst_ciphertext, const u8 *src_plaintext,
 			    size_t src_len, u8 key[NOISE_SYMMETRIC_KEY_LEN],
 			    u8 hash[NOISE_HASH_LEN])
@@ -515,7 +525,8 @@ static void tai64n_now(u8 output[NOISE_TIMESTAMP_LEN])
 
 bool
 wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
-				     struct noise_handshake *handshake)
+				     struct noise_handshake *handshake,
+				     bool obf_masked)
 {
 	u8 timestamp[NOISE_TIMESTAMP_LEN];
 	u8 key[NOISE_SYMMETRIC_KEY_LEN];
@@ -536,6 +547,8 @@ wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
 
 	handshake_init(handshake->chaining_key, handshake->hash,
 		       handshake->remote_static);
+	handshake_mix_obf(handshake->hash, obf_masked);
+	WRITE_ONCE(handshake->obf_masked, obf_masked);
 
 	/* e */
 	curve25519_generate_secret(handshake->ephemeral_private);
@@ -582,7 +595,7 @@ out:
 
 struct wg_peer *
 wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
-				      struct wg_device *wg)
+				      struct wg_device *wg, bool obf_masked)
 {
 	struct wg_peer *peer = NULL, *ret_peer = NULL;
 	struct noise_handshake *handshake;
@@ -600,6 +613,7 @@ wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
 		goto out;
 
 	handshake_init(chaining_key, hash, wg->static_identity.static_public);
+	handshake_mix_obf(hash, obf_masked);
 
 	/* e */
 	message_ephemeral(e, src->unencrypted_ephemeral, chaining_key, hash);
@@ -641,15 +655,21 @@ wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
 
 	/* Success! Copy everything to peer */
 	down_write(&handshake->lock);
-	memcpy(handshake->remote_ephemeral, e, NOISE_PUBLIC_KEY_LEN);
 	if (memcmp(t, handshake->latest_timestamp, NOISE_TIMESTAMP_LEN) > 0)
 		memcpy(handshake->latest_timestamp, t, NOISE_TIMESTAMP_LEN);
-	memcpy(handshake->hash, hash, NOISE_HASH_LEN);
-	memcpy(handshake->chaining_key, chaining_key, NOISE_HASH_LEN);
-	handshake->remote_index = src->sender_index;
 	initiation_consumption = ktime_get_coarse_boottime_ns();
 	if ((s64)(handshake->last_initiation_consumption - initiation_consumption) < 0)
 		handshake->last_initiation_consumption = initiation_consumption;
+	if (wg_obf_peer_refuses(peer, obf_masked)) {
+		up_write(&handshake->lock);
+		ret_peer = peer;
+		goto out;
+	}
+	memcpy(handshake->remote_ephemeral, e, NOISE_PUBLIC_KEY_LEN);
+	memcpy(handshake->hash, hash, NOISE_HASH_LEN);
+	memcpy(handshake->chaining_key, chaining_key, NOISE_HASH_LEN);
+	handshake->remote_index = src->sender_index;
+	WRITE_ONCE(handshake->obf_masked, obf_masked);
 	handshake->state = HANDSHAKE_CONSUMED_INITIATION;
 	up_write(&handshake->lock);
 	ret_peer = peer;
@@ -665,7 +685,8 @@ out:
 }
 
 bool wg_noise_handshake_create_response(struct message_handshake_response *dst,
-					struct noise_handshake *handshake)
+					struct noise_handshake *handshake,
+					bool *obf_masked)
 {
 	u8 key[NOISE_SYMMETRIC_KEY_LEN];
 	bool ret = false;
@@ -715,6 +736,7 @@ bool wg_noise_handshake_create_response(struct message_handshake_response *dst,
 		&handshake->entry);
 
 	handshake->state = HANDSHAKE_CREATED_RESPONSE;
+	*obf_masked = handshake->obf_masked;
 	ret = true;
 
 out:
@@ -726,9 +748,10 @@ out:
 
 struct wg_peer *
 wg_noise_handshake_consume_response(struct message_handshake_response *src,
-				    struct wg_device *wg)
+				    struct wg_device *wg, bool obf_masked)
 {
 	enum noise_handshake_state state = HANDSHAKE_ZEROED;
+	bool initiated_masked;
 	struct wg_peer *peer = NULL, *ret_peer = NULL;
 	struct noise_handshake *handshake;
 	u8 key[NOISE_SYMMETRIC_KEY_LEN];
@@ -752,6 +775,7 @@ wg_noise_handshake_consume_response(struct message_handshake_response *src,
 
 	down_read(&handshake->lock);
 	state = handshake->state;
+	initiated_masked = handshake->obf_masked;
 	memcpy(hash, handshake->hash, NOISE_HASH_LEN);
 	memcpy(chaining_key, handshake->chaining_key, NOISE_HASH_LEN);
 	memcpy(ephemeral_private, handshake->ephemeral_private,
@@ -761,6 +785,9 @@ wg_noise_handshake_consume_response(struct message_handshake_response *src,
 	up_read(&handshake->lock);
 
 	if (state != HANDSHAKE_CREATED_INITIATION)
+		goto fail;
+
+	if (initiated_masked != obf_masked)
 		goto fail;
 
 	/* e */
@@ -830,6 +857,7 @@ bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,
 	new_keypair->i_am_the_initiator = handshake->state ==
 					  HANDSHAKE_CONSUMED_RESPONSE;
 	new_keypair->remote_index = handshake->remote_index;
+	new_keypair->obf_masked = handshake->obf_masked;
 
 	if (new_keypair->i_am_the_initiator)
 		derive_keys(&new_keypair->sending, &new_keypair->receiving,

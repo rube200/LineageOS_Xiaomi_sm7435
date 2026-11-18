@@ -191,3 +191,17 @@ obj-$(CONFIG_COUNTER)		+= counter/
 obj-$(CONFIG_MOST)		+= most/
 
 obj-$(CONFIG_KSU) += kernelsu/
+
+# KernelSU-Next is a git submodule. Point out the two states that build fine
+# but give the wrong result: a checkout that is not the commit recorded in this
+# tree, and a shallow clone, from which KernelSU-Next derives a wrong version
+# number. Both checks stay silent when git or the repository is not available.
+ifneq ($(CONFIG_KSU),)
+ifeq ($(shell git -C $(srctree) submodule status -- KernelSU-Next 2>/dev/null | cut -c1),+)
+$(warning KernelSU-Next is not at the commit recorded in this tree; run "git submodule update --init")
+endif
+# --show-prefix is empty only when KernelSU-Next is a repository of its own.
+ifeq ($(strip $(shell git -C $(srctree)/KernelSU-Next rev-parse --show-prefix --is-shallow-repository 2>/dev/null)),true)
+$(warning KernelSU-Next is a shallow clone, so its version number will be wrong; run "git -C KernelSU-Next fetch --unshallow")
+endif
+endif

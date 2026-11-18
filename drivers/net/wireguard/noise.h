@@ -35,6 +35,7 @@ struct noise_keypair {
 	struct noise_replay_counter receiving_counter;
 	__le32 remote_index;
 	bool i_am_the_initiator;
+	bool obf_masked;
 	struct kref refcount;
 	struct rcu_head rcu;
 	u64 internal_id;
@@ -83,6 +84,8 @@ struct noise_handshake {
 	u8 latest_timestamp[NOISE_TIMESTAMP_LEN];
 	__le32 remote_index;
 
+	bool obf_masked;
+
 	/* Protects all members except the immutable (after noise_handshake_
 	 * init): remote_static, precomputed_static_static, static_identity.
 	 */
@@ -118,16 +121,18 @@ void wg_noise_precompute_static_static(struct wg_peer *peer);
 
 bool
 wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
-				     struct noise_handshake *handshake);
+				     struct noise_handshake *handshake,
+				     bool obf_masked);
 struct wg_peer *
 wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
-				      struct wg_device *wg);
+				      struct wg_device *wg, bool obf_masked);
 
 bool wg_noise_handshake_create_response(struct message_handshake_response *dst,
-					struct noise_handshake *handshake);
+					struct noise_handshake *handshake,
+					bool *obf_masked);
 struct wg_peer *
 wg_noise_handshake_consume_response(struct message_handshake_response *src,
-				    struct wg_device *wg);
+				    struct wg_device *wg, bool obf_masked);
 
 bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,
 				      struct noise_keypairs *keypairs);

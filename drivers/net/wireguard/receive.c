@@ -35,7 +35,7 @@ static void update_rx_stats(struct wg_peer *peer, size_t len)
 
 static void wg_obf_note_peer_format(struct wg_peer *peer, struct sk_buff *skb)
 {
-	wg_obf_peer_note_rx_format(peer, PACKET_CB(skb)->obf_learned);
+	wg_obf_peer_note_rx_format(peer, PACKET_CB(skb)->obf_masked);
 }
 
 static int prepare_skb_header(struct sk_buff *skb)
@@ -89,6 +89,7 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 	 * system. We don't care about races with it at all.
 	 */
 	static u64 last_under_load;
+	const bool masked = PACKET_CB(skb)->obf_masked;
 	bool packet_needs_cookie;
 	bool under_load;
 
@@ -132,7 +133,8 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 							message->sender_index);
 			return;
 		}
-		peer = wg_noise_handshake_consume_initiation(message, wg);
+		peer = wg_noise_handshake_consume_initiation(message, wg,
+							     masked);
 		if (unlikely(!peer)) {
 			net_dbg_skb_ratelimited("%s: Invalid handshake initiation from %pISpfsc\n",
 						wg->dev->name, skb);
@@ -143,6 +145,12 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 		net_dbg_ratelimited("%s: Receiving handshake initiation from peer %llu (%pISpfsc)\n",
 				    wg->dev->name, peer->internal_id,
 				    &peer->endpoint.addr);
+		if (unlikely(wg_obf_peer_refuses(peer, masked))) {
+			net_dbg_ratelimited("%s: Handshake initiation from peer %llu is not in the configured obfuscation format, initiating instead\n",
+					    wg->dev->name, peer->internal_id);
+			wg_packet_send_queued_handshake_initiation(peer, false);
+			break;
+		}
 		wg_packet_send_handshake_response(peer);
 		break;
 	}
@@ -155,7 +163,7 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 							message->sender_index);
 			return;
 		}
-		peer = wg_noise_handshake_consume_response(message, wg);
+		peer = wg_noise_handshake_consume_response(message, wg, masked);
 		if (unlikely(!peer)) {
 			net_dbg_skb_ratelimited("%s: Invalid handshake response from %pISpfsc\n",
 						wg->dev->name, skb);
@@ -166,6 +174,10 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 		net_dbg_ratelimited("%s: Receiving handshake response from peer %llu (%pISpfsc)\n",
 				    wg->dev->name, peer->internal_id,
 				    &peer->endpoint.addr);
+		if (unlikely(wg_obf_peer_refuses(peer, masked))) {
+			wg_packet_send_queued_handshake_initiation(peer, false);
+			break;
+		}
 		if (wg_noise_handshake_begin_session(&peer->handshake,
 						     &peer->keypairs)) {
 			wg_timers_session_derived(peer);
@@ -347,8 +359,9 @@ static void wg_packet_consume_data_done(struct wg_peer *peer,
 	wg_timers_any_authenticated_packet_traversal(peer);
 
 	/* A packet with length 0 is a keepalive packet */
-	if (unlikely(!skb->len)) {
-		update_rx_stats(peer, message_data_len(0));
+	if (unlikely(!skb->len || (PACKET_CB(skb)->keypair->obf_masked &&
+				   wg_obf_is_padding(skb)))) {
+		update_rx_stats(peer, message_data_len(skb->len));
 		net_dbg_ratelimited("%s: Receiving keepalive packet from peer %llu (%pISpfsc)\n",
 				    dev->name, peer->internal_id,
 				    &peer->endpoint.addr);
@@ -519,6 +532,10 @@ static void wg_packet_consume_data(struct wg_device *wg, struct sk_buff *skb)
 	if (unlikely(READ_ONCE(peer->is_dead)))
 		goto err;
 
+	if (unlikely(PACKET_CB(skb)->keypair->obf_masked !=
+		     PACKET_CB(skb)->obf_masked))
+		goto err;
+
 	ret = wg_queue_enqueue_per_device_and_peer(&wg->decrypt_queue, &peer->rx_queue, skb,
 						   wg->packet_crypt_wq);
 	if (unlikely(ret == -EPIPE))
@@ -542,7 +559,7 @@ void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb)
 	if (unlikely(prepare_skb_header(skb) < 0))
 		goto err;
 
-	msg_type = wg_obf_parse_message(skb);
+	msg_type = wg_obf_parse_message(wg, skb);
 	if (unlikely(!msg_type))
 		goto err;
 	if (unlikely(!pskb_may_pull(skb, skb->len)))

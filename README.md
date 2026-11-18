@@ -20,7 +20,7 @@ integration:
 
 | Where | What |
 |-------|------|
-| `KernelSU-Next/` | Submodule tracking branch `dev`; the pointer is bumped weekly by `.github/workflows/sync-upstream.yml` |
+| `KernelSU-Next/` | Submodule pinned to a KernelSU-Next release; the weekly sync in `.github/workflows/sync-upstream.yml` moves it to the newest `vX.Y.Z` release tag |
 | `drivers/kernelsu` | Symlink to `../KernelSU-Next/kernel` — only that subdir is built |
 | `drivers/Kconfig` | `source "drivers/kernelsu/Kconfig"` |
 | `drivers/Makefile` | `obj-$(CONFIG_KSU) += kernelsu/` |
@@ -32,108 +32,111 @@ Neither `git clone` nor `repo sync` fetches the submodule, and without it
 git submodule update --init --recursive
 ```
 
-Bump it with `git submodule update --remote KernelSU-Next`, then commit the new
-pointer.
+Run it again after every pull or `repo sync`. The recorded commit moves when
+the weekly sync picks up a new release, and a checkout that lags behind still
+builds, using the older KernelSU-Next. The build prints a warning from
+`drivers/Makefile` when the checkout is not the recorded commit.
+
+Keep the submodule a full clone (no `--depth`). KernelSU-Next takes its version
+from its own git history at build time (30000 + number of commits) and prints
+it as `-- KernelSU-Next version: …`. A shallow clone reports 30001, and a build
+without `git` falls back to 1. The build warns about a shallow clone as well.
+
+To move to another release by hand, check out its tag in the submodule and
+commit the new pointer:
+
+```
+git -C KernelSU-Next fetch --tags origin
+git -C KernelSU-Next checkout v3.4.2
+git add KernelSU-Next
+```
+
+The weekly sync always sets the pointer to the newest release tag, so a manual
+pin to anything else only lasts until the next sync.
 
 `CONFIG_KSU` defaults to `y` and its dependencies (`KPROBES`, `EXT4_FS`) are
 already set in `gki_defconfig`, so a normal build compiles root in with no
 defconfig change here. For the remaining options and how root itself works, see
 upstream.
 
+## Weekly sync
+
+`.github/workflows/sync-upstream.yml` runs every Thursday, and on manual
+dispatch from the default branch. When LineageOS `lineage-23.2` has moved or
+the submodule is not at the newest KernelSU-Next release tag (`vX.Y.Z`; side
+lines such as `v3.4.0-legacy` are ignored), it:
+
+1. rebases the commits of this repo onto the new upstream tip and folds the new
+   KernelSU-Next pointer into the existing submodule commit;
+2. pushes the result to the branch `sync-candidate`;
+3. compiles `drivers/net/wireguard/` and `drivers/kernelsu/` from that branch
+   (arm64, `gki_defconfig`, clang) in a job that only has a read-only token;
+4. moves the default branch to the candidate and deletes `sync-candidate`, but
+   only if the compile succeeded.
+
+If the rebase conflicts or the compile fails, the default branch is left alone.
+After a failed compile `sync-candidate` stays in place so the result can be
+inspected; the next run overwrites it.
+
+After each successful sync the tag `sync-upstream-base` is set to the upstream
+commit the default branch now sits on. If LineageOS ever rewrites the history
+of its branch, the next sync uses that tag to replay only this repo's commits,
+and not the upstream commits that were dropped by the rewrite.
+
+Every sync rewrites the default branch: it is force-pushed, and the rebased
+commits get new hashes with `github-actions[bot]` as committer. To bring a
+clone up to date afterwards:
+
+```
+git fetch origin
+git reset --hard origin/lineage-23.2
+git submodule update --init --recursive
+```
+
+Local commits and open pull requests have to be rebased onto the new branch.
+
+`SYNC_TOKEN` is an optional repository secret: a personal access token with
+write access to the repository contents. When it is set the workflow uses it
+for checkout and push; otherwise it uses the built-in `GITHUB_TOKEN`. Set it
+if the built-in token is not allowed to update the default branch.
+
 ---
 
 ## WireGuard obfuscation
 
-The in-kernel WireGuard driver (`drivers/net/wireguard/`) adds optional **UDP packet obfuscation** so traffic is harder to fingerprint as WireGuard. Everything upstream stays the same — Noise handshakes, session keys, and **ChaCha20-Poly1305** payload encryption (ChaCha20 encrypts the tunneled IP data; Poly1305 verifies it was not tampered with). Only the UDP bytes actually sent on the network are changed; in-kernel structs and crypto are not.
+The in-kernel WireGuard driver (`drivers/net/wireguard/`) can send its UDP
+packets in two wire formats. Noise handshakes, session keys and
+**ChaCha20-Poly1305** payload encryption are the same in both; only the bytes
+on the network differ.
 
-| | Upstream | This repo |
-|---|----------|-----------|
-| Handshakes, keys, ChaCha20-Poly1305 payloads | unchanged | unchanged |
-| UDP packet layout (header + optional handshake padding) | standard | obfuscated when enabled |
-| Netlink | standard | + `WGPEER_A_OBFUSCATION`, `WGPEER_A_OBFUSCATION_FORMAT` |
-| Driver version / device attr | `1.0.0` / absent | `1.0.0+obf1` / `WGDEVICE_A_OBFUSCATION_SUPPORT=1` |
+| Value | Format | What an observer sees |
+|-------|--------|----------------------|
+| 0 | standard | Plain WireGuard; works with stock WireGuard peers |
+| 1 | obfuscated ("masked") | The first 16 bytes of every packet (type, indices, data counter) masked with a keyed hash, so the contents cannot be matched without the key; handshakes and data packets get random lengths; the format is bound into the handshake, so it cannot be switched on the path. Timing stays visible (see Limitations) |
 
-Encode before send, decode after receive — then normal WireGuard processing. Stock WireGuard peers cannot interoperate unless both sides run this driver (client needs userspace that sets the new netlink attr).
+The obfuscated format only works between peers that both run this driver (or
+an implementation of the spec below).
 
 ## Detecting obfuscation support (apps)
 
-VPN apps need to distinguish **WireGuard present** from **obfuscation UAPI supported**.
-Peer attrs 9/10 only appear on peer dump, so an empty `wg0` gives no obfuscation signal.
-Use the device-level capability below (works with zero peers).
+Peer attributes only appear when a peer exists, so use the device-level
+attribute, which is present even with zero peers:
 
 | Signal | Where | Meaning |
 |--------|-------|---------|
-| `WGDEVICE_A_OBFUSCATION_SUPPORT == 1` | GET_DEVICE dump on any `wg*` iface | **Preferred** — kernel supports obfuscation UAPI |
-| `/sys/module/wireguard/version` contains `+obf` | sysfs | Fallback — e.g. `1.0.0+obf1` |
-| `dmesg`: `WireGuard 1.0.0+obf1 loaded` | boot log | Same as sysfs |
-| `WG_GENL_VERSION` | still `1` | Netlink protocol unchanged; do not use for feature detect |
+| `WGDEVICE_A_OBFUSCATION_SUPPORT == 1` | GET_DEVICE dump on any `wg*` interface | Kernel supports the obfuscation UAPI |
+| `/sys/module/wireguard/version` contains `+obf` | sysfs | Fallback, e.g. `1.0.0+obf1` |
+| `WG_GENL_VERSION` | still `1` | Unchanged; do not use for feature detection |
 
-**App probe flow (recommended):**
+**App probe flow:**
 
-1. Confirm WireGuard: `ip link add wg0 type wireguard` (or VpnService equivalent).
-2. Issue `WG_CMD_GET_DEVICE` / `wg show wg0 dump` with **zero peers** (read the **first** dump message if the reply is multi-part).
-3. If the device message includes `WGDEVICE_A_OBFUSCATION_SUPPORT` with value `1`, enable obfuscation UI and SET `WGPEER_A_OBFUSCATION` on the server peer.
-4. If absent, treat as stock WireGuard (hide obfuscation option).
+1. Create the interface (`ip link add wg0 type wireguard` or the VpnService
+   equivalent).
+2. Send `WG_CMD_GET_DEVICE` and read the **first** reply message.
+3. If `WGDEVICE_A_OBFUSCATION_SUPPORT` (ID 9) is `1`, offer obfuscation.
+4. If it is absent, treat the kernel as stock WireGuard.
 
-**Do not** bump or parse `WG_GENL_VERSION` for this feature. Do not send `WGDEVICE_A_OBFUSCATION_SUPPORT` on SET (kernel returns `-EINVAL`). Stock `wireguard-tools` ignores unknown device attrs; patched apps must read the attr by ID from `wireguard.h` (`WGDEVICE_A_OBFUSCATION_SUPPORT`, numeric ID 9).
-
-### Tests
-
-In-kernel selftests live in `drivers/net/wireguard/selftest/obfuscation.c`
-(same pattern as upstream WireGuard selftests). They run once at driver init when
-`CONFIG_WIREGUARD_DEBUG=y` is enabled; failure prevents WireGuard from loading.
-
-Coverage:
-
-- Header encode/decode for all message types
-- Handshake suffix length (0 and max 32 bytes)
-- Send decision (`wg_obf_active_for_send`) — configured vs reactive
-- RX format learning, configured override, reset on `wg down`
-- UAPI format helper
-- Round-trip wrap + parse (initiation, cookie, data packets)
-
-Not covered: live UDP on the network, netlink from userspace, or two-phone
-end-to-end — those need a debug kernel build plus manual / VPN testing on device.
-
----
-
-## Packet format (network)
-
-What leaves the phone on UDP vs standard WireGuard. Inside the kernel, message
-structs are unchanged; this is only the encoding of those bytes for transmit.
-
-### Message header (all packet types)
-
-The 32-bit header field is normally `type = MESSAGE_*` (1–4). With obfuscation
-enabled, bytes 1–3 carry random junk and byte 0 is XOR-mixed:
-
-```
-byte0 = msg_type XOR junk[0] XOR junk[1] XOR junk[2]
-byte1 = junk[0]
-byte2 = junk[1]
-byte3 = junk[2]
-```
-
-If any of bytes 1–3 are non-zero, the packet is treated as obfuscated on RX.
-
-### Handshake packets (initiation, response, cookie)
-
-After the normal handshake struct, the sender may append **0–32 bytes** of random
-trailing junk (`WG_OBF_SUFFIX_MAX = 32`). Suffix length is derived from the
-header junk:
-
-```
-suffix_len = (junk[0] ^ junk[1] ^ junk[2]) % 33
-```
-
-On RX, suffix is stripped after length validation; the Noise/cookie layers see the
-standard struct size.
-
-### Data packets
-
-Only the **4-byte header** is obfuscated. `key_idx` and `counter` stay visible
-in the UDP packet (same as standard data packets after the header). Payload
-encryption is unchanged.
+Never send `WGDEVICE_A_OBFUSCATION_SUPPORT` on SET (`-EINVAL`).
 
 ---
 
@@ -143,59 +146,192 @@ Vendor netlink attributes (see `include/uapi/linux/wireguard.h`):
 
 | Attribute | ID | SET | GET |
 |-----------|----|-----|-----|
-| `WGDEVICE_A_OBFUSCATION_SUPPORT` | 9 | — (read-only; `-EINVAL` on SET) | u8 `1` (first GET dump message only) |
-| `WGPEER_A_OBFUSCATION` | 9 | u8 `0` or `1` | u8 `0` or `1` (only if configured) |
-| `WGPEER_A_OBFUSCATION_FORMAT` | 10 | — (read-only) | u8 format enum |
+| `WGDEVICE_A_OBFUSCATION_SUPPORT` | 9 | — (`-EINVAL`) | u8 `1` (first dump message only) |
+| `WGDEVICE_A_OBFUSCATION_KEY` | 10 | 32 bytes; all zeros removes it | 32 bytes, only if set (first dump message only) |
+| `WGPEER_A_OBFUSCATION` | 11 | u8 `0` or `1` (anything else: `-EINVAL`, nothing is changed) | u8, only if configured |
+| `WGPEER_A_OBFUSCATION_FORMAT` | 12 | — (read-only) | u8 format enum |
 
-Format values (`wgpeer_obfuscation_format`):
+Format values (`wgpeer_obfuscation_format`), the format used for sending:
 
 - `WGPEER_OBFUSCATION_FORMAT_STANDARD` (1)
 - `WGPEER_OBFUSCATION_FORMAT_OBFUSCATED` (2)
 
-### Client (outbound obfuscation)
+A reactive peer reads as `STANDARD` until it has learned otherwise.
+`WGPEER_OBFUSCATION_FORMAT_UNKNOWN` (0) is reserved and never reported.
 
-Set obfuscation on the server peer:
+### Shared secret (optional)
+
+`WGDEVICE_A_OBFUSCATION_KEY` is an optional 32-byte secret on the interface.
+It is mixed into the keys that mask packets in both directions, so the
+interfaces at **both ends** must have the same value: set it on the server's
+interface and on each client's interface. Without it, the masks are derived
+from the public keys alone.
+
+The secret belongs to the interface rather than to a peer, because the server
+has to unmask a handshake before it knows which client sent it. To use servers
+with different secrets from one phone, give each server its own interface.
+
+If the secret is set on only one end, or differs, obfuscated packets cannot be
+unmasked and the peers do not connect. Standard-format traffic is not affected.
+
+### Client (configured format)
+
+Turn obfuscation on for the server peer:
 
 ```
 wg set <iface> peer <server_pubkey> obfuscation 1
 ```
 
-Netlink: include `WGPEER_A_OBFUSCATION = 1`. Use `0` to force standard packets.
+Netlink: include `WGPEER_A_OBFUSCATION = 1` (or `0` to force standard packets).
+The configured value controls what is sent, whatever was received.
 
-Once set, the configured value controls TX regardless of what was learned from
-RX.
+A peer configured to `1` only takes part in obfuscated handshakes. If the other
+side starts a standard handshake, it does not answer and starts an obfuscated
+handshake of its own instead; because of WireGuard's handshake rate limit this
+can take up to 5 seconds when it handshaked just before. A peer configured to
+`0` does the same with obfuscated handshakes.
+
+Changing the value ends the current session, so the next packet starts a new
+handshake in the new format.
 
 ### Server (reactive mode)
 
-**Omit** `WGPEER_A_OBFUSCATION` on SET for each client peer. The driver learns
-the packet format per peer from the first **authenticated** RX packet (handshake
-after Noise validation, data after decrypt + replay check).
+**Omit** `WGPEER_A_OBFUSCATION` for each client peer. A reactive peer accepts
+both formats and answers in the format of what it last received from that
+peer, after authentication (handshake after Noise validation, data after
+decryption and the replay check). Each client is independent.
 
-Each client is independent: one peer may use obfuscation, another standard.
+A newly created peer entry has learned nothing yet. If the server is the side
+that starts the first handshake with it, that handshake goes out in standard
+format. A client configured to `1` refuses it and starts an obfuscated
+handshake, which the server then follows, but the one standard packet is
+visible on the wire. Where every client obfuscates, the server's peers can be
+configured too instead of left reactive.
 
-There is no network negotiation; format is inferred from headers or prior
-learning.
-
-### Peer state fields (`drivers/net/wireguard/peer.h`)
+### Peer state (`drivers/net/wireguard/peer.h`, `noise.h`)
 
 | Field | Meaning |
 |-------|---------|
-| `obfuscation_configured` | User set `WGPEER_A_OBFUSCATION` (0/1) |
-| `obfuscation_outbound` | Configured TX mode when `obfuscation_configured` |
-| `obfuscation_learned` | Reactive RX-learned format when not configured |
+| `peer->obfuscation_configured` | `WGPEER_A_OBFUSCATION` was set |
+| `peer->obfuscation_outbound` | The configured format (on/off) |
+| `peer->obfuscation_learned` | Reactive: format of the last authenticated packet |
+| `peer->obf_key` | Masks packets sent to this peer |
+| `handshake->obf_masked`, `keypair->obf_masked` | The handshake, and the session it creates, are obfuscated |
 
-TX decision (`wg_obf_active_for_send`):
+`wg_obf_peer_masked()` picks the format for a new handshake: the configured
+one, otherwise the learned one. Data follows the session it belongs to.
+
+`wg down` does not touch these fields.
+
+---
+
+## Packet format (network)
+
+Both formats carry the standard WireGuard messages unchanged; only the
+encoding on the wire differs.
+
+### Standard (0)
+
+Upstream WireGuard. The first 4 bytes are the message type (1 initiation,
+2 response, 3 cookie reply, 4 data) as a little-endian 32-bit value, so bytes
+1–3 are zero.
+
+### Obfuscated (1)
+
+**Keys.** Each side derives a 128-bit SipHash key from a static public key and
+the optional shared secret:
 
 ```
-if (obfuscation_configured) → obfuscation_outbound
-else                         → obfuscation_learned
+K(pub) = first 16 bytes of BLAKE2s-256("mask-key" || pub)
+         keyed with the 32-byte secret when one is set, unkeyed otherwise,
+         read as two little-endian 64-bit words k0, k1
 ```
 
-On `wg down` (`wg_obf_peer_reset_format`):
+A message is masked with **K(receiver's public key)**. The one exception is a
+cookie reply, which goes to a sender that has not been identified yet: it is
+masked with **K(cookie sender's own public key)**, which the receiver knows
+because it is the peer it was trying to reach.
 
-- **Reactive peers:** `obfuscation_learned` is **kept** across down/up.
-- **Configured peers:** `obfuscation_learned` is cleared (outbound/configured
-  unchanged).
+**Mask.** Bytes 0–15 of the message are XORed with a 16-byte mask computed from
+bytes 16–31 (the sample), which are always unpredictable (ephemeral key, nonce
+or ciphertext):
+
+```
+mask[0..8)  = LE64(SipHash-2-4(k0, k1, sample || LE64(0)))
+mask[8..16) = LE64(SipHash-2-4(k0, k1, sample || LE64(1)))
+```
+
+For a cookie reply, mask bytes 4–7 are zero, so its receiver index stays
+readable: the receiver looks the index up among its own pending handshakes and
+sessions to find the peer and with it the key.
+
+**Handshake messages.** The message is built and its MACs are computed as
+usual. In an initiation and a response, the top bit of the last byte of the
+ephemeral public key (byte 39 of an initiation, byte 43 of a response) is then
+set to a random value; it is always 0 in a real key. `random(0..255)` random
+bytes are appended, then the mask is applied.
+
+**Data messages.** Instead of WireGuard's padding to a multiple of 16 bytes,
+the plaintext gets `random(0..64)` zero bytes of padding, never past the
+interface MTU. The packet is encrypted as usual, then the mask is applied; the
+sample is the first 16 bytes of ciphertext. A keepalive is padded the same
+way, so a decrypted plaintext whose first byte is below `0x10` (no IP version)
+is a keepalive.
+
+**Handshake binding.** Both sides mix the 8 ASCII bytes `mask-hs-` into the
+handshake hash right after the responder's static public key, that is right
+after `h = HASH(h || S_pub_r)` and before the ephemeral key is mixed in. An
+obfuscated initiation can therefore only be answered by an obfuscated response,
+and a handshake changed into the other format on the way fails. A session
+created by an obfuscated handshake only sends and accepts obfuscated data; a
+standard session only standard data.
+
+**Receiving.** A message whose first 4 bytes are a standard header (type 1–4,
+bytes 1–3 zero) with the standard length is standard. Otherwise, unmask with
+K(own public key) and accept if the result is type 1, 2 or 4 with bytes 1–3
+zero and a valid length (handshake: its normal size plus 0–255 bytes; data: at
+least 32 bytes). Otherwise, if the length is 64–319, treat bytes 4–7 as a
+receiver index; if it belongs to one of our obfuscated handshakes or sessions,
+unmask with that peer's key (cookie variant) and accept type 3. Then cut the
+appended bytes off a handshake, clear the ephemeral key's top bit, and continue
+with the standard message.
+
+**Test vectors** (also checked by the in-kernel self-test):
+
+```
+public key   00 01 02 .. 1f
+sample       a0 a1 a2 .. af
+data message 04000000 11223344 0500000000000000 | a0a1..af
+
+without a secret
+  K          k0 = 0xdf8274b472fe767b, k1 = 0xc489316d5dc67351
+  mask       e458f62e4e3b6f19 4804953cc9678a77
+  cookie     e458f62e00000000 4804953cc9678a77
+  data       e058f62e5f195c5d 4d04953cc9678a77 | a0a1..af
+
+with the secret 40 41 42 .. 5f
+  K          k0 = 0xc1ad46c4c6c36b25, k1 = 0xa6c289b4e0712562
+  mask       2d155c03ea88e24a aea34b9944375149
+```
+
+---
+
+## Tests
+
+In-kernel self-tests live in `drivers/net/wireguard/selftest/obfuscation.c`.
+They run once at driver init when `CONFIG_WIREGUARD_DEBUG=y`; a failure stops
+WireGuard from loading. They cover:
+
+- Format selection: configured vs reactive, refusal rules, UAPI format
+- Key derivation with and without the secret, mask and data message against
+  the test vectors above
+- Wrap and parse of every handshake type, wrong key, wrong variant, random
+  ephemeral top bit
+- Header and length validation, standard messages
+- Data padding range and MTU limit, keepalive padding detection
+
+Not covered by the self-tests: live UDP between two peers and netlink from
+userspace; those were exercised with two network namespaces in an emulator.
 
 ---
 
@@ -203,41 +339,60 @@ On `wg down` (`wg_obf_peer_reset_format`):
 
 | File | Role |
 |------|------|
-| `drivers/net/wireguard/obfuscation.c`, `obfuscation.h` | Encode/decode, parse, wrap, send decision |
-| `drivers/net/wireguard/send.c` | Obfuscate handshake and data headers on TX |
-| `drivers/net/wireguard/receive.c` | Parse before dispatch; learn format on RX |
-| `drivers/net/wireguard/netlink.c` | Peer GET/SET; device GET emits `WGDEVICE_A_OBFUSCATION_SUPPORT`; SET rejects it |
-| `drivers/net/wireguard/version.h` | Driver version string (`1.0.0+obf1`); must match `WG_OBFUSCATION_UAPI_VERSION` |
-| `drivers/net/wireguard/peer.h` | Peer obfuscation fields |
-| `drivers/net/wireguard/device.c` | `wg_obf_peer_reset_format()` on interface stop |
+| `drivers/net/wireguard/obfuscation.c`, `obfuscation.h` | Keys, mask, padding, wrap, parse, format selection |
+| `drivers/net/wireguard/noise.c`, `noise.h` | Handshake binding (`mask-hs-`), obfuscated flag on handshake and session |
+| `drivers/net/wireguard/send.c` | Encode handshakes, cookie replies and data on TX; data padding |
+| `drivers/net/wireguard/receive.c` | Parse before dispatch; refusal rules; session format check; padded keepalives; learn format |
+| `drivers/net/wireguard/netlink.c` | Peer GET/SET; device GET/SET of the secret; device GET emits the support attribute; SET rejects it |
+| `drivers/net/wireguard/peer.c`, `peer.h` | Per-peer format state and key |
+| `drivers/net/wireguard/peerlookup.c`, `peerlookup.h` | Finds the key for an obfuscated cookie reply from its receiver index |
+| `drivers/net/wireguard/device.c`, `device.h` | Device key and secret, follow the private key and the secret |
+| `drivers/net/wireguard/queueing.h` | Received format in the packet control block |
+| `drivers/net/wireguard/version.h` | Driver version string (`1.0.0+obf1`), generated from `WG_OBFUSCATION_UAPI_VERSION` |
 | `include/uapi/linux/wireguard.h` | UAPI attribute definitions |
-| `drivers/net/wireguard/selftest/obfuscation.c` | DEBUG selftests |
-| `drivers/net/wireguard/Makefile` | Adds `obfuscation.o` |
+| `drivers/net/wireguard/selftest/obfuscation.c` | DEBUG self-tests |
 
 ---
 
 ## Limitations and notes
 
-- **Not hidden crypto:** header XOR and trailing junk are reversible; this is
-  obfuscation for classification evasion, not secrecy.
-- **No stock interop:** upstream WireGuard cannot parse obfuscated packets.
-- **Userspace:** driver change is kernel-side only; VPN apps / `wg` must send
-  netlink attr 9 for client configuration.
-- **Queued packets:** toggling obfuscation may not apply to packets already in
-  the encrypt queue until the next batch.
-- **Reactive unconfigure:** omitting attr 9 on SET does not revert a peer to
-  reactive mode after it was configured; remove and re-add the peer instead.
-- **`obf_wire_len`:** stored in `skb` control block for RX byte stats on
-  obfuscated handshakes; not required for protocol logic.
+- **Not encryption:** obfuscation only makes the traffic harder to classify.
+  Timing is not hidden.
+- **What stays visible:** full-size packets cannot be padded further, so a
+  stream of packets at the interface MTU still looks like a tunnel at full
+  speed. A cookie reply's receiver index is readable.
+- **Who can undo it:** without the shared secret, anyone who knows the
+  receiver's public key; packets to the server can be unmasked by anyone who
+  has the server's public key. With the secret, they also need the secret.
+- **No stock interop:** stock WireGuard only understands the standard format.
+- **Userspace:** apps / `wg` must send netlink attribute 11
+  (`WGPEER_A_OBFUSCATION`) to configure a client, and attribute 10
+  (`WGDEVICE_A_OBFUSCATION_KEY`) to set the secret.
+- **Queued packets:** packets already in the encrypt queue keep the format they
+  were queued with.
+- **Reactive unconfigure:** omitting attribute 11 on SET does not return a
+  configured peer to reactive mode; remove and re-add the peer.
+- **Attribute numbers:** the vendor attributes take the next free numbers after
+  upstream's (device 9 and 10; peer 11 and 12). A future upstream attribute
+  would claim the same numbers. `netlink.c` checks them at build time, so a
+  merge that shifts them fails to compile instead of silently changing what
+  apps talk to.
+- **Byte counters:** received handshake bytes are counted with the obfuscated
+  length (`obf_wire_len` in the packet control block).
 
 ---
 
 ## Security
 
-Format learning happens only after authentication (Noise handshake or data
-decrypt + replay window check). Configured clients are not overwritten by RX
-learning. No extra heap allocations in the obfuscation path; skb and peer
-lifecycle match upstream WireGuard.
+Format learning happens only after authentication (Noise handshake, or data
+after decryption and the replay check), and configured peers never learn. An
+obfuscated handshake binds its format, so neither the handshake nor the
+session it creates can be switched to the standard format on the path. The
+data padding is inside the encryption and authenticated. The obfuscation path
+allocates nothing for ordinary packets; only when a received buffer is shared
+(for example while a packet socket is capturing) is the header copied before
+it is rewritten, so other readers of that buffer keep seeing the bytes that
+were on the wire. skb and peer lifecycle match upstream WireGuard.
 
 ---
 

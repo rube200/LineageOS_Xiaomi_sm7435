@@ -6,6 +6,7 @@
 #include "peerlookup.h"
 #include "peer.h"
 #include "noise.h"
+#include "obfuscation.h"
 
 static struct hlist_head *pubkey_bucket(struct pubkey_hashtable *table,
 					const u8 pubkey[NOISE_PUBLIC_KEY_LEN])
@@ -223,4 +224,34 @@ wg_index_hashtable_lookup(struct index_hashtable *table,
 	}
 	rcu_read_unlock_bh();
 	return entry;
+}
+
+bool wg_index_hashtable_obf_key(struct index_hashtable *table,
+				const __le32 index, siphash_key_t *key)
+{
+	struct index_hashtable_entry *entry;
+	struct wg_peer *peer;
+	bool masked = false;
+
+	rcu_read_lock_bh();
+	hlist_for_each_entry_rcu_bh(entry, index_bucket(table, index),
+				    index_hash) {
+		if (entry->index != index)
+			continue;
+		if (entry->type == INDEX_HASHTABLE_HANDSHAKE)
+			masked = READ_ONCE(container_of(entry,
+							struct noise_handshake,
+							entry)->obf_masked);
+		else if (entry->type == INDEX_HASHTABLE_KEYPAIR)
+			masked = container_of(entry, struct noise_keypair,
+					      entry)->obf_masked;
+		peer = READ_ONCE(entry->peer);
+		if (masked && peer)
+			wg_obf_peer_key(peer, key);
+		else
+			masked = false;
+		break;
+	}
+	rcu_read_unlock_bh();
+	return masked;
 }

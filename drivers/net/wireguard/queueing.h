@@ -62,7 +62,7 @@ struct packet_cb {
 	atomic_t state;
 	u32 mtu;
 	u8 ds;
-	bool obf_learned;
+	bool obf_masked;
 	u16 obf_wire_len;
 };
 

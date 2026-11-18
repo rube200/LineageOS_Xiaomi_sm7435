@@ -10,7 +10,6 @@
 #include "ratelimiter.h"
 #include "peer.h"
 #include "messages.h"
-#include "obfuscation.h"
 
 #include <linux/module.h>
 #include <linux/rtnetlink.h>
@@ -109,7 +108,6 @@ static int wg_stop(struct net_device *dev)
 		wg_noise_handshake_clear(&peer->handshake);
 		wg_noise_keypairs_clear(&peer->keypairs);
 		wg_noise_reset_last_sent_handshake(&peer->last_sent_handshake);
-		wg_obf_peer_reset_format(peer);
 	}
 	mutex_unlock(&wg->device_update_lock);
 	while ((skb = ptr_ring_consume(&wg->handshake_queue.ring)) != NULL)
@@ -247,6 +245,7 @@ static void wg_destruct(struct net_device *dev)
 	rcu_barrier(); /* Wait for all the peers to be actually freed. */
 	wg_ratelimiter_uninit();
 	memzero_explicit(&wg->static_identity, sizeof(wg->static_identity));
+	memzero_explicit(wg->obf_secret, sizeof(wg->obf_secret));
 	free_percpu(dev->tstats);
 	kvfree(wg->index_hashtable);
 	kvfree(wg->peer_hashtable);
@@ -303,6 +302,7 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
 	init_rwsem(&wg->static_identity.lock);
 	mutex_init(&wg->socket_update_lock);
 	mutex_init(&wg->device_update_lock);
+	seqlock_init(&wg->obf_key_lock);
 	wg_allowedips_init(&wg->peer_allowedips);
 	wg_cookie_checker_init(&wg->cookie_checker, wg);
 	INIT_LIST_HEAD(&wg->peer_list);

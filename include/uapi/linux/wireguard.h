@@ -32,6 +32,8 @@
  *    WGDEVICE_A_OBFUSCATION_SUPPORT: NLA_U8 (vendor extension, read-only;
  *        present on patched kernels; value equals WG_OBFUSCATION_UAPI_VERSION;
  *        first dump message only; must not be sent on SET (-EINVAL))
+ *    WGDEVICE_A_OBFUSCATION_KEY: NLA_EXACT_LEN, len WG_KEY_LEN (vendor
+ *        extension; only present when set; first dump message only)
  *    WGDEVICE_A_PEERS: NLA_NESTED
  *        0: NLA_NESTED
  *            WGPEER_A_PUBLIC_KEY: NLA_EXACT_LEN, len WG_KEY_LEN
@@ -52,11 +54,13 @@
  *                    ...
  *                ...
  *            WGPEER_A_PROTOCOL_VERSION: NLA_U32
- *            WGPEER_A_OBFUSCATION: NLA_U8, 0 or 1 (vendor extension; omitted on
- *                SET leaves reactive mode; present forces off or on)
+ *            WGPEER_A_OBFUSCATION: NLA_U8, 0 or 1, only present when
+ *                configured (vendor extension)
  *            WGPEER_A_OBFUSCATION_FORMAT: NLA_U8 (vendor extension, read-only;
  *                WGPEER_OBFUSCATION_FORMAT_STANDARD or
- *                WGPEER_OBFUSCATION_FORMAT_OBFUSCATED)
+ *                WGPEER_OBFUSCATION_FORMAT_OBFUSCATED; this is the format
+ *                used for sending, so a reactive peer reports STANDARD
+ *                until it has learned otherwise)
  *        0: NLA_NESTED
  *            ...
  *        ...
@@ -69,7 +73,8 @@
  * coalesce adjacent peers. Likewise, it is possible that all peers will
  * not fit within a single message. So, subsequent messages contain only
  * WGDEVICE_A_PEERS (remaining peers). Device-level attributes (IFINDEX,
- * IFNAME, LISTEN_PORT, FWMARK, keys, WGDEVICE_A_OBFUSCATION_SUPPORT)
+ * IFNAME, LISTEN_PORT, FWMARK, keys, WGDEVICE_A_OBFUSCATION_SUPPORT,
+ * WGDEVICE_A_OBFUSCATION_KEY)
  * appear only in the first message of a dump. It is then up to the
  * receiver to coalesce these messages to form the complete list of peers.
  * Apps probing obfuscation support must read the first GET_DEVICE reply.
@@ -94,6 +99,9 @@
  *    WGDEVICE_A_LISTEN_PORT: NLA_U16, 0 to choose randomly
  *    WGDEVICE_A_FWMARK: NLA_U32, 0 to disable
  *    WGDEVICE_A_OBFUSCATION_SUPPORT: must not be sent on SET (-EINVAL)
+ *    WGDEVICE_A_OBFUSCATION_KEY: len WG_KEY_LEN, all zeros to remove (vendor
+ *        extension; optional secret mixed into the obfuscation keys; the
+ *        same value has to be set on the interfaces at both ends)
  *    WGDEVICE_A_PEERS: NLA_NESTED
  *        0: NLA_NESTED
  *            WGPEER_A_PUBLIC_KEY: len WG_KEY_LEN
@@ -122,8 +130,11 @@
  *                                       most recent protocol will be used when
  *                                       this is unset. Otherwise, must be set
  *                                       to 1.
- *            WGPEER_A_OBFUSCATION: NLA_U8, 0 or 1 (vendor extension; omit on
- *                servers for reactive mode per peer; set on clients)
+ *            WGPEER_A_OBFUSCATION: NLA_U8 (vendor extension): 0 standard,
+ *                1 obfuscated; anything else is -EINVAL and changes nothing.
+ *                Omit it on servers for reactive mode (answer in the format
+ *                received); set it on clients. Once set it cannot be unset;
+ *                remove and re-add the peer.
  *        0: NLA_NESTED
  *            ...
  *        ...
@@ -183,6 +194,7 @@ enum wgdevice_attribute {
 	WGDEVICE_A_FWMARK,
 	WGDEVICE_A_PEERS,
 	WGDEVICE_A_OBFUSCATION_SUPPORT,
+	WGDEVICE_A_OBFUSCATION_KEY,
 	__WGDEVICE_A_LAST
 };
 #define WGDEVICE_A_MAX (__WGDEVICE_A_LAST - 1)
@@ -213,7 +225,7 @@ enum wgpeer_attribute {
 #define WGPEER_A_MAX (__WGPEER_A_LAST - 1)
 
 enum wgpeer_obfuscation_format {
-	WGPEER_OBFUSCATION_FORMAT_UNKNOWN = 0,
+	WGPEER_OBFUSCATION_FORMAT_UNKNOWN = 0,	/* reserved, never reported */
 	WGPEER_OBFUSCATION_FORMAT_STANDARD = 1,
 	WGPEER_OBFUSCATION_FORMAT_OBFUSCATED = 2,
 };

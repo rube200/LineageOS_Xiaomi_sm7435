@@ -10,6 +10,7 @@
 #include "noise.h"
 #include "cookie.h"
 
+#include <linux/siphash.h>
 #include <linux/types.h>
 #include <linux/netfilter.h>
 #include <linux/spinlock.h>
@@ -67,6 +68,7 @@ struct wg_peer {
 	bool obfuscation_configured;
 	bool obfuscation_outbound;
 	bool obfuscation_learned;
+	siphash_key_t obf_key;
 };
 
 struct wg_peer *wg_peer_create(struct wg_device *wg,
